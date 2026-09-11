@@ -90,9 +90,20 @@ class ExchangeTuning:
     size_units: tuple[str, ...] = ("Б", "КБ", "МБ", "ГБ", "ТБ")
 
 
+@dataclass(frozen=True)
+class EncryptionTuning:
+    """Шифрування архіву через pyzipper (AES) — єдина зовнішня залежність проєкту,
+    свідомий виняток із "мінімум залежностей". Докладніше: docs/concept.md."""
+    default_level: str = "none"
+    default_compress: bool = True
+    aes128_bits: int = 128
+    aes256_bits: int = 256
+
+
 CONNECTION = ConnectionTuning()
 NAT = NatTuning()
 STUN = StunTuning()
 PROFILE = ProfileTuning()
 APPEARANCE = AppearanceTuning()
 EXCHANGE = ExchangeTuning()
+ENCRYPTION = EncryptionTuning()

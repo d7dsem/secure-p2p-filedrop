@@ -5,17 +5,33 @@
 prepare_archive() — весь каталог одним ZIP; list_entries()+build_archive_from_selection() — вибіркове пакування.
 """
 
+import enum
 import os
 import tempfile
 import zipfile
 from dataclasses import dataclass
 
-from tuning import EXCHANGE
+import pyzipper
+
+from tuning import ENCRYPTION, EXCHANGE
+
+
+class EncryptionLevel(enum.Enum):
+    """Рівні шифрування архіву — "none" навмисно означає нульову безпеку (відкритий ZIP)."""
+    NONE = "none"
+    AES128 = "aes128"
+    AES256 = "aes256"
+
+
+_AES_BITS = {
+    EncryptionLevel.AES128: ENCRYPTION.aes128_bits,
+    EncryptionLevel.AES256: ENCRYPTION.aes256_bits,
+}
 
 
 def prepare_archive(path: str, is_dir: bool) -> str:
-    """Каталог -> ZIP у тимчасовій директорії (без пароля/AES, умисно — див. docs/concept.md,
-    "Відомі технічні компроміси"); файл -> шлях без змін."""
+    """Старий шлях без вибору вмісту й без шифрування — каталог -> ZIP; файл -> шлях без змін.
+    Для шифрування/вибіркового пакування — build_archive_from_selection()."""
     if not path:
         raise ValueError("Спочатку оберіть файл або каталог.")
 
@@ -86,17 +102,33 @@ def list_entries(dir_path: str, exclude_names: frozenset[str] = frozenset()) -> 
     return entries
 
 
-def build_archive_from_selection(root_dir: str, included_files: list[str]) -> str:
-    """Пакує included_files (абсолютні шляхи під root_dir) у ZIP в технічній підпапці
-    EXCHANGE.pack_subdir_name — саме тому вона виключається з list_entries()."""
+def build_archive_from_selection(
+    root_dir: str,
+    included_files: list[str],
+    encryption: EncryptionLevel = EncryptionLevel.NONE,
+    compress: bool = True,
+    password: bytes | None = None,
+) -> str:
+    """Пакує included_files у ZIP (pyzipper) у технічній підпапці EXCHANGE.pack_subdir_name.
+    AES128/256 вимагає password (байти) — інакше ValueError; NONE пише звичайний відкритий ZIP."""
     if not included_files:
         raise ValueError("Не обрано жодного файлу для архівування.")
+    if encryption in _AES_BITS and not password:
+        raise ValueError("Для AES-шифрування потрібен пароль (сесійний ключ із хендшейку).")
 
     pack_dir = os.path.join(root_dir, EXCHANGE.pack_subdir_name)
     os.makedirs(pack_dir, exist_ok=True)
     archive_path = os.path.join(pack_dir, EXCHANGE.archive_file_name)
+    compression = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
 
-    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf_kwargs = {"compression": compression}
+    if encryption in _AES_BITS:
+        zf_kwargs["encryption"] = pyzipper.WZ_AES
+
+    with pyzipper.AESZipFile(archive_path, "w", **zf_kwargs) as zf:
+        if encryption in _AES_BITS:
+            zf.setpassword(password)
+            zf.setencryption(pyzipper.WZ_AES, nbits=_AES_BITS[encryption])
         for full_path in included_files:
             arcname = os.path.relpath(full_path, root_dir)
             zf.write(full_path, arcname)

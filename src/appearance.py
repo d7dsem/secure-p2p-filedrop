@@ -14,11 +14,11 @@ import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from connection import build_handshake_packet, derive_key, detect_local_address, key_fingerprint, parse_handshake_packet
-from exchange import build_archive_from_selection, format_size, list_entries, prepare_archive
+from exchange import EncryptionLevel, build_archive_from_selection, format_size, list_entries, prepare_archive
 from local_config import LocalConfig, config_path, load_config, save_config
 from nat_traversal import UpnpError, try_configure_port_forwarding
 from stun_client import StunError, get_public_address
-from tuning import APPEARANCE, CONNECTION, EXCHANGE, STUN
+from tuning import APPEARANCE, CONNECTION, ENCRYPTION, EXCHANGE, STUN
 
 _TREE_LOADING_SUFFIX = "/__loading__"
 
@@ -27,6 +27,14 @@ _HOST_SOURCE_LABELS = {
     "stun": "публічна, через STUN (порт НЕ прокинуто, мапінг може бути тимчасовим)",
     None: "локальна, LAN-only",
 }
+
+# Людяні підписи для Combobox шифрування; ключ — те, що реально йде в build_archive_from_selection.
+_ENCRYPTION_LEVEL_LABELS = {
+    EncryptionLevel.NONE: "Без шифрування (передача у відкриту — нульова безпека)",
+    EncryptionLevel.AES128: "AES-128",
+    EncryptionLevel.AES256: "AES-256",
+}
+_ENCRYPTION_LABEL_TO_LEVEL = {label: level for level, label in _ENCRYPTION_LEVEL_LABELS.items()}
 
 
 class SecureFileClientApp:
@@ -133,6 +141,17 @@ class SecureFileClientApp:
         style.map("Treeview.Heading",
                   background=[("active", APPEARANCE.dark_bg_panel), ("pressed", APPEARANCE.dark_entry_bg)],
                   foreground=[("active", APPEARANCE.dark_fg), ("pressed", APPEARANCE.dark_fg)])
+        style.configure("TCombobox", fieldbackground=APPEARANCE.dark_entry_bg, foreground=APPEARANCE.dark_fg,
+                         background=APPEARANCE.dark_entry_bg, bordercolor=APPEARANCE.dark_border,
+                         arrowcolor=APPEARANCE.dark_fg)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", APPEARANCE.dark_entry_bg)],
+                  foreground=[("readonly", APPEARANCE.dark_fg)])
+        # Випадний список Combobox — окремий Tk-Listbox, стилем ttk не керується.
+        self.root.option_add("*TCombobox*Listbox.background", APPEARANCE.dark_entry_bg)
+        self.root.option_add("*TCombobox*Listbox.foreground", APPEARANCE.dark_fg)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", APPEARANCE.dark_accent)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", APPEARANCE.dark_fg)
 
     def _style_text_widget(self, widget):
         widget.configure(
@@ -152,6 +171,16 @@ class SecureFileClientApp:
             activebackground=APPEARANCE.dark_bg, activeforeground=APPEARANCE.dark_fg,
             highlightthickness=0, borderwidth=0,
         )
+
+    def _make_reserved_label(self, parent, text: str, wraplength: int, height: int, **pack_kwargs) -> ttk.Label:
+        """Label у Frame фіксованої висоти — щоб ріст тексту (1->N рядків) не двигав вікно.
+        Докладніше: docs/dev-notes.md → "appearance.py: _make_reserved_label"."""
+        holder = ttk.Frame(parent, height=height)
+        holder.pack(fill="x", **pack_kwargs)
+        holder.pack_propagate(False)
+        label = ttk.Label(holder, text=text, wraplength=wraplength, justify="left")
+        label.pack(anchor="nw", fill="both")
+        return label
 
     # ---- побудова інтерфейсу -----------------------------------------
 
@@ -288,8 +317,9 @@ class SecureFileClientApp:
         self._style_text_widget(self.text_out)
         self.text_out.configure(state="disabled")
 
-        self.lbl_local_fp = ttk.Label(frame_out, text="Код підтвердження: —", wraplength=340)
-        self.lbl_local_fp.pack(anchor="w", padx=8, pady=(0, 8))
+        self.lbl_local_fp = self._make_reserved_label(
+            frame_out, "Код підтвердження: —", wraplength=340, height=40, padx=8, pady=(0, 8)
+        )
 
         # --- Секція: вхідний хендшейк ---
         frame_in = ttk.LabelFrame(parent, text="Хендшейк співрозмовника (вставити з месенджера)")
@@ -307,8 +337,9 @@ class SecureFileClientApp:
             btns_in, text="Обробити вхідний хендшейк", command=self.on_process_incoming
         ).pack(side="left")
 
-        self.lbl_peer_fp = ttk.Label(frame_in, text="Код підтвердження ключа: —", wraplength=340)
-        self.lbl_peer_fp.pack(anchor="w", padx=8, pady=(0, 4))
+        self.lbl_peer_fp = self._make_reserved_label(
+            frame_in, "Код підтвердження ключа: —", wraplength=340, height=40, padx=8, pady=(0, 4)
+        )
 
     def _build_session_right(self, parent: ttk.Frame):
         pad = {"padx": 10, "pady": 6}
@@ -326,8 +357,9 @@ class SecureFileClientApp:
             btns_file, text="Обрати каталог...", command=self.on_choose_dir
         ).pack(side="left", padx=8)
 
-        self.lbl_selected = ttk.Label(frame_file, text="Нічого не обрано", wraplength=520)
-        self.lbl_selected.pack(anchor="w", padx=8, pady=(0, 4))
+        self.lbl_selected = self._make_reserved_label(
+            frame_file, "Нічого не обрано", wraplength=520, height=60, padx=8, pady=(0, 4)
+        )
 
         # Дерево з'являється лише для каталогу; кнопка передачі — нижче, поза деревом
         # (потрібна і для одиночного файлу). Підкаталоги — лінивим довантаженням.
@@ -366,6 +398,24 @@ class SecureFileClientApp:
             self.frame_tree, "Запакувати в один архів (інакше — передати файли як є)",
             self.var_archive_before_send,
         ).pack(anchor="w", padx=8, pady=(4, 0))
+
+        # Стиснення й шифрування архіву — стосуються лише режиму "запакувати в архів".
+        # Вибір AES128/256 автоматично вмикає архівування (шифрування без архіву не має сенсу).
+        options_row = ttk.Frame(self.frame_tree)
+        options_row.pack(fill="x", padx=8, pady=(4, 0))
+
+        self.var_compress = tk.BooleanVar(value=ENCRYPTION.default_compress)
+        self._make_checkbutton(options_row, "Стиснення", self.var_compress).pack(side="left")
+
+        ttk.Label(options_row, text="Шифрування:").pack(side="left", padx=(16, 4))
+        default_label = _ENCRYPTION_LEVEL_LABELS[EncryptionLevel(ENCRYPTION.default_level)]
+        self.var_encryption_label = tk.StringVar(value=default_label)
+        encryption_combo = ttk.Combobox(
+            options_row, textvariable=self.var_encryption_label,
+            values=list(_ENCRYPTION_LEVEL_LABELS.values()), state="readonly", width=32,
+        )
+        encryption_combo.pack(side="left")
+        self.var_encryption_label.trace_add("write", self._on_encryption_level_change)
 
         btns_transfer = ttk.Frame(frame_file)
         btns_transfer.pack(fill="x", padx=8, pady=8)
@@ -447,6 +497,12 @@ class SecureFileClientApp:
 
     def _toggle_pass_visibility(self):
         self.entry_passphrase.configure(show="" if self.var_show_pass.get() else "*")
+
+    def _on_encryption_level_change(self, *_args):
+        """AES128/256 без архіву не має сенсу — авто-вмикаємо архівування при виборі AES."""
+        level = _ENCRYPTION_LABEL_TO_LEVEL[self.var_encryption_label.get()]
+        if level != EncryptionLevel.NONE:
+            self.var_archive_before_send.set(True)
 
     # ---- допоміжне ------------------------------------------------------
 
@@ -800,9 +856,27 @@ class SecureFileClientApp:
             )
             return
 
-        if self.var_archive_before_send.get():
+        encryption_level = _ENCRYPTION_LABEL_TO_LEVEL[self.var_encryption_label.get()]
+        # AES без архіву не має сенсу (шифрується сам ZIP-контейнер) — форсуємо архівування.
+        should_archive = self.var_archive_before_send.get() or encryption_level != EncryptionLevel.NONE
+
+        if should_archive:
+            password = None
+            if encryption_level != EncryptionLevel.NONE:
+                if self.local_key is None:
+                    messagebox.showwarning(
+                        "Увага",
+                        "Спочатку згенеруйте хендшейк — сесійний ключ використовується як "
+                        "пароль AES-шифрування архіву.",
+                    )
+                    return
+                password = self.local_key
+
             try:
-                archive_path = build_archive_from_selection(self.selected_path, included_files)
+                archive_path = build_archive_from_selection(
+                    self.selected_path, included_files,
+                    encryption=encryption_level, compress=self.var_compress.get(), password=password,
+                )
             except ValueError as e:
                 messagebox.showerror("Помилка пакування", str(e))
                 return
@@ -812,8 +886,11 @@ class SecureFileClientApp:
             self.lbl_selected.configure(
                 text=f"Каталог: {self.selected_path}  →  запаковано: {archive_path}"
             )
+            compress_kind = "зі стисненням" if self.var_compress.get() else "без стиснення"
+            encryption_kind = _ENCRYPTION_LEVEL_LABELS[encryption_level]
             self.var_transfer_status.set(
-                f"Готово до передачі: 1 архів ({len(included_files)} файл(и/ів) усередині)."
+                f"Готово до передачі: 1 архів ({len(included_files)} файл(и/ів) усередині, "
+                f"{compress_kind}, {encryption_kind})."
             )
             self._set_status(
                 f"Готово до передачі: архів з {len(included_files)} файл(и/ів). "
@@ -821,8 +898,8 @@ class SecureFileClientApp:
             )
             self._log(
                 f"Ініціалізація передачі: запаковано {len(included_files)} файл(и/ів) у {archive_path} "
-                f"(технічна підпапка {EXCHANGE.pack_subdir_name}, не входить у вибір). "
-                f"Фаза 3 ще не реалізована."
+                f"({compress_kind}, {encryption_kind}; технічна підпапка {EXCHANGE.pack_subdir_name}, "
+                f"не входить у вибір). Фаза 3 ще не реалізована."
             )
         else:
             self.packed_archive_path = None

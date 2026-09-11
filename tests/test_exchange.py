@@ -12,7 +12,9 @@ import zipfile
 
 import _pathfix  # noqa: F401  (додає src/ у sys.path перед наступними імпортами)
 
-from exchange import build_archive_from_selection, format_size, list_entries, prepare_archive
+import pyzipper
+
+from exchange import EncryptionLevel, build_archive_from_selection, format_size, list_entries, prepare_archive
 from tuning import EXCHANGE
 
 
@@ -208,6 +210,69 @@ class BuildArchiveFromSelectionTests(unittest.TestCase):
         entries = list_entries(self.tmp_dir, exclude_names=frozenset({EXCHANGE.pack_subdir_name}))
         names = {e.name for e in entries}
         self.assertNotIn(EXCHANGE.pack_subdir_name, names)
+
+
+class EncryptionAndCompressionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="test_encryption_")
+        self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
+        self.a_path = os.path.join(self.tmp_dir, "a.txt")
+        with open(self.a_path, "w", encoding="utf-8") as f:
+            f.write("secret content" * 20)  # достатньо великий, щоб стиснення реально мало ефект
+
+    def test_default_none_level_is_plain_zip_readable_by_stdlib(self):
+        archive_path = build_archive_from_selection(self.tmp_dir, [self.a_path])
+        with zipfile.ZipFile(archive_path) as zf:
+            self.assertEqual(zf.read("a.txt").decode("utf-8"), "secret content" * 20)
+
+    def test_compress_true_uses_deflate(self):
+        archive_path = build_archive_from_selection(self.tmp_dir, [self.a_path], compress=True)
+        with zipfile.ZipFile(archive_path) as zf:
+            self.assertEqual(zf.getinfo("a.txt").compress_type, zipfile.ZIP_DEFLATED)
+
+    def test_compress_false_uses_stored(self):
+        archive_path = build_archive_from_selection(self.tmp_dir, [self.a_path], compress=False)
+        with zipfile.ZipFile(archive_path) as zf:
+            self.assertEqual(zf.getinfo("a.txt").compress_type, zipfile.ZIP_STORED)
+
+    def test_aes128_round_trip_with_correct_password(self):
+        archive_path = build_archive_from_selection(
+            self.tmp_dir, [self.a_path], encryption=EncryptionLevel.AES128, password=b"session-key-bytes"
+        )
+        with pyzipper.AESZipFile(archive_path) as zf:
+            zf.setpassword(b"session-key-bytes")
+            self.assertEqual(zf.read("a.txt").decode("utf-8"), "secret content" * 20)
+
+    def test_aes256_round_trip_with_correct_password(self):
+        archive_path = build_archive_from_selection(
+            self.tmp_dir, [self.a_path], encryption=EncryptionLevel.AES256, password=b"session-key-bytes"
+        )
+        with pyzipper.AESZipFile(archive_path) as zf:
+            zf.setpassword(b"session-key-bytes")
+            self.assertEqual(zf.read("a.txt").decode("utf-8"), "secret content" * 20)
+
+    def test_aes_wrong_password_fails_to_decrypt(self):
+        archive_path = build_archive_from_selection(
+            self.tmp_dir, [self.a_path], encryption=EncryptionLevel.AES256, password=b"correct-password"
+        )
+        with pyzipper.AESZipFile(archive_path) as zf:
+            zf.setpassword(b"wrong-password")
+            with self.assertRaises(Exception):
+                zf.read("a.txt")
+
+    def test_aes_without_password_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            build_archive_from_selection(self.tmp_dir, [self.a_path], encryption=EncryptionLevel.AES128)
+
+    def test_aes_archive_not_readable_via_plain_zipfile_content(self):
+        # Заголовки ZIP видно завжди (це не секрет), але вміст файлу без пароля не читається.
+        archive_path = build_archive_from_selection(
+            self.tmp_dir, [self.a_path], encryption=EncryptionLevel.AES128, password=b"pw"
+        )
+        with zipfile.ZipFile(archive_path) as zf:
+            self.assertIn("a.txt", zf.namelist())
+            with self.assertRaises(Exception):
+                zf.read("a.txt")
 
 
 if __name__ == "__main__":
