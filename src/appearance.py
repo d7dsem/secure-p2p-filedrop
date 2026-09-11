@@ -404,7 +404,9 @@ class SecureFileClientApp:
         )
         self.text_out.pack(fill="x", padx=8, pady=(0, 4))
         self._style_text_widget(self.text_out)
-        self.text_out.configure(state="disabled")
+        # Не state="disabled" — блокує й виділення мишею (dev-notes.md), а хендшейк
+        # звідси саме й треба вручну виділяти/копіювати.
+        self._make_readonly_selectable(self.text_out)
 
         self.lbl_local_fp = self._make_reserved_label(
             frame_out, "Код підтвердження: —", wraplength=340, height=40, padx=8, pady=(0, 8)
@@ -689,10 +691,8 @@ class SecureFileClientApp:
         self.local_key = derive_key(passphrase, salt, iterations)
         self.local_port = port  # порт, на якому РЕАЛЬНО слухатимемо (не effective_port — dev-notes.md)
 
-        self.text_out.configure(state="normal")
         self.text_out.delete("1.0", "end")
         self.text_out.insert("1.0", text)
-        self.text_out.configure(state="disabled")
 
         host_kind = _HOST_SOURCE_LABELS[self.public_host_source]
         self.lbl_local_fp.configure(

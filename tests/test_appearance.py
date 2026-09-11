@@ -219,6 +219,32 @@ class GeneratePassphraseTests(AppearanceTestCase):
         self.assertEqual(str(self.app.entry_passphrase["show"]), "")
 
 
+class HandshakeTextCopyableTests(AppearanceTestCase):
+    """Регресія реального бага: text_out із state="disabled" блокував і виділення
+    мишею, тому ручне копіювання хендшейку мовчки нічого не копіювало.
+    Докладніше: docs/dev-notes.md → "appearance.py: text_out"."""
+
+    def test_generated_handshake_is_selectable_via_sel_tag(self):
+        self.app.var_passphrase.set("test-pass")
+        self.app.on_generate_handshake()
+        content = self.app.text_out.get("1.0", "end").strip()
+        self.assertTrue(content)
+
+        self.app.text_out.tag_add("sel", "1.0", "end")
+        selected = self.app.text_out.get("sel.first", "sel.last").strip()
+        self.assertEqual(selected, content)
+
+    def test_typing_into_generated_handshake_is_blocked(self):
+        self.app.var_passphrase.set("test-pass")
+        self.app.on_generate_handshake()
+        before = self.app.text_out.get("1.0", "end")
+
+        self.app.text_out.event_generate("<KeyPress-x>")
+
+        after = self.app.text_out.get("1.0", "end")
+        self.assertEqual(before, after)
+
+
 class ChannelEventHandlingTests(AppearanceTestCase):
     """_handle_channel_event — регресія знайдених security/code-ревʼю багів:
     канал має явно позначатись розірваним при помилці прийому/закритті, не
