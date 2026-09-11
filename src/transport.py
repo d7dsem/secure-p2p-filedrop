@@ -116,6 +116,17 @@ def establish_connection(
         try:
             listener.bind(("0.0.0.0", local_port))
             listener.listen(TRANSPORT.listen_backlog)
+        except OSError as e:
+            # Порт зайнятий (напр. вже запущений інстанс) чи інша помилка bind/listen.
+            # У режимі "лише слухати" (peer невідомий) це фатально — не чекаємо повний
+            # timeout, done.set() одразу. Інакше лишаємо шанс _connect_worker.
+            with result_lock:
+                result.setdefault("bind_error", e)
+            if peer_host is None or peer_port is None:
+                done.set()
+            listener.close()
+            return
+        try:
             listener.settimeout(TRANSPORT.accept_poll_timeout_seconds)
             while not done.is_set() and not stop_event.is_set():
                 try:
@@ -159,11 +170,18 @@ def establish_connection(
 
     with result_lock:
         sock = result.get("sock")
+        bind_error = result.get("bind_error")
     if sock is None:
+        if bind_error is not None and (peer_host is None or peer_port is None):
+            raise ConnectionFailed(
+                f"Не вдалось слухати на порту {local_port}: {bind_error}. "
+                f"Ймовірно порт зайнятий іншим процесом (напр. вже запущений застосунок)."
+            ) from bind_error
         target = f"{peer_host}:{peer_port}" if peer_host is not None else "(адреса іншої сторони невідома)"
+        detail = f" (додатково: не вдалось слухати на порту {local_port}: {bind_error})" if bind_error else ""
         raise ConnectionFailed(
             f"Не вдалось встановити з'єднання з {target} за {timeout}с "
-            f"(ні прийняти вхідне на порту {local_port}, ні підключитись)."
+            f"(ні прийняти вхідне на порту {local_port}, ні підключитись){detail}."
         )
     return sock
 
@@ -190,7 +208,7 @@ def verify_channel(sock: socket.socket, key: bytes, timeout: float | None = None
         expected = hmac.new(key, my_nonce, hashlib.sha256).digest()
         if not hmac.compare_digest(peer_proof, expected):
             raise VerificationError("Код підтвердження ключа не збігається з іншою стороною.")
-    except (TransportError, OSError, socket.timeout) as e:
+    except (TransportError, OSError) as e:
         if isinstance(e, VerificationError):
             raise
         raise VerificationError(f"Не вдалось підтвердити ключ: {e}") from e

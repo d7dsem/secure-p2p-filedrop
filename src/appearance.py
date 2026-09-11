@@ -15,7 +15,7 @@ from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from connection import build_handshake_packet, derive_key, detect_local_address, key_fingerprint, parse_handshake_packet
-from exchange import EncryptionLevel, build_archive_from_selection, format_size, list_entries, prepare_archive
+from exchange import EncryptionLevel, build_archive_from_selection, format_size, list_entries
 from local_config import LocalConfig, config_path, load_config, save_config
 from nat_traversal import UpnpError, try_configure_port_forwarding
 from stun_client import StunError, get_public_address
@@ -660,7 +660,9 @@ class SecureFileClientApp:
         try:
             packet = parse_handshake_packet(raw_text)
             salt = base64.b64decode(packet["salt"])
-            iterations = int(packet["iter"])
+            # Нижня межа — захист від підробленого/зниженого "iter" у чужому пакеті,
+            # що змусило б слабшу деривацію ключа (dev-notes.md).
+            iterations = max(int(packet["iter"]), CONNECTION.min_iterations)
         except Exception as e:
             messagebox.showerror("Помилка розбору хендшейку", str(e))
             self._log(f"Обробка вхідного хендшейку — ПОМИЛКА: {e}")
@@ -726,17 +728,25 @@ class SecureFileClientApp:
         threading.Thread(target=self._channel_establish_worker, args=(session_key,), daemon=True).start()
 
     def _channel_establish_worker(self, session_key: bytes):
-        """Фоновий потік — жодних звернень до self.root/tkinter, лише мережа й запис у чергу."""
+        """Фоновий потік — жодних звернень до self.root/tkinter, лише мережа й запис у чергу.
+        Широкі except Exception — щоб неочікувана помилка не вбила потік мовчки (dev-notes.md)."""
         try:
             sock = establish_connection(self.local_port, self.peer_host, self.peer_port)
         except ConnectionFailed as e:
             self._channel_queue.put({"kind": "connection_failed", "error": str(e)})
+            return
+        except Exception as e:
+            self._channel_queue.put({"kind": "connection_failed", "error": f"{type(e).__name__}: {e}"})
             return
         try:
             verify_channel(sock, session_key)
         except VerificationError as e:
             sock.close()
             self._channel_queue.put({"kind": "verification_failed", "error": str(e)})
+            return
+        except Exception as e:
+            sock.close()
+            self._channel_queue.put({"kind": "verification_failed", "error": f"{type(e).__name__}: {e}"})
             return
         self._channel_queue.put({"kind": "connected", "socket": sock, "key": session_key})
 
@@ -786,10 +796,18 @@ class SecureFileClientApp:
             )
 
         elif kind == "receive_error":
+            # Прийом на цій стороні зупинено назавжди (dev-notes.md) — канал більше
+            # не робочий в обох напрямках, це має бути видно користувачу, не лише в лозі.
+            self.channel_verified = False
+            self.var_channel_status.set("Канал розірвано (помилка прийому) — передача файлів неможлива.")
             self._log(f"Канал передачі: помилка прийому — {event['error']}")
+            self._update_send_button_state()
 
         elif kind == "receive_closed":
+            self.channel_verified = False
+            self.var_channel_status.set("Інша сторона закрила з'єднання — канал більше не активний.")
             self._log("Канал передачі: інша сторона закрила з'єднання.")
+            self._update_send_button_state()
 
         elif kind == "send_done":
             self.var_transfer_status.set(f"Надіслано {event['count']} файл(и/ів).")
@@ -814,6 +832,11 @@ class SecureFileClientApp:
                 return
             except TransportError as e:
                 self._channel_queue.put({"kind": "receive_error", "error": str(e)})
+                return
+            except Exception as e:
+                # Побитий/ворожий кадр чи зникнення диска — теж має зупинити цикл із
+                # видимою помилкою, а не тихо вбити потік (dev-notes.md).
+                self._channel_queue.put({"kind": "receive_error", "error": f"{type(e).__name__}: {e}"})
                 return
 
     def _update_send_button_state(self):
@@ -849,6 +872,10 @@ class SecureFileClientApp:
             self._channel_queue.put({"kind": "send_done", "count": len(files)})
         except TransportError as e:
             self._channel_queue.put({"kind": "send_error", "error": str(e)})
+        except Exception as e:
+            # Напр. файл зник/заблокований між "Ініціалізувати" й "Надіслати" —
+            # має розблокувати кнопку з видимою помилкою, а не тихо вбити потік.
+            self._channel_queue.put({"kind": "send_error", "error": f"{type(e).__name__}: {e}"})
 
     def _start_connection_setup(self):
         """Триетапна модель UPnP → STUN → LAN-only, автоматично й у фоновому потоці.
@@ -864,29 +891,35 @@ class SecureFileClientApp:
         self.root.after(150, self._poll_connection_setup)
 
     def _connection_setup_worker(self, port: int):
-        """Фоновий потік — жодних звернень до self.root/tkinter, лише мережа й запис у чергу."""
+        """Фоновий потік — жодних звернень до self.root/tkinter, лише мережа й запис у чергу.
+        Зовнішній try/except Exception — щоб неочікувана помилка (напр. побита XML-відповідь
+        роутера, ET.ParseError) не лишила чергу порожньою назавжди; фолбек на LAN-only."""
         result: dict = {"port": port}
         try:
-            local_ip = detect_local_address()
-            external_ip = try_configure_port_forwarding(local_ip, port)
-        except UpnpError as e:
-            result["upnp_error"] = str(e)
-        else:
-            result["source"] = "upnp"
-            result["host"] = external_ip
-            result["port_used"] = port  # UPnP мапить зовнішній порт == внутрішньому
-            self._conn_setup_queue.put(result)
-            return
+            try:
+                local_ip = detect_local_address()
+                external_ip = try_configure_port_forwarding(local_ip, port)
+            except UpnpError as e:
+                result["upnp_error"] = str(e)
+            else:
+                result["source"] = "upnp"
+                result["host"] = external_ip
+                result["port_used"] = port  # UPnP мапить зовнішній порт == внутрішньому
+                self._conn_setup_queue.put(result)
+                return
 
-        try:
-            stun_ip, stun_port = get_public_address(port)
-        except StunError as e:
-            result["stun_error"] = str(e)
+            try:
+                stun_ip, stun_port = get_public_address(port)
+            except StunError as e:
+                result["stun_error"] = str(e)
+                result["source"] = None
+            else:
+                result["source"] = "stun"
+                result["host"] = stun_ip
+                result["port_used"] = stun_port  # НЕ port: NAT сам обирає зовнішній (dev-notes.md)
+        except Exception as e:
+            result.setdefault("upnp_error", f"неочікувана помилка: {type(e).__name__}: {e}")
             result["source"] = None
-        else:
-            result["source"] = "stun"
-            result["host"] = stun_ip
-            result["port_used"] = stun_port  # НЕ port: NAT сам обирає зовнішній (dev-notes.md)
 
         self._conn_setup_queue.put(result)
 
@@ -1183,6 +1216,3 @@ class SecureFileClientApp:
             f"incoming={self.profile.incoming_dir}, outgoing={self.profile.outgoing_dir}."
         )
 
-    def prepare_archive(self) -> str:
-        """Делегує підготовку архіву в шар "обмін" (exchange.py)."""
-        return prepare_archive(self.selected_path, self.selected_is_dir)

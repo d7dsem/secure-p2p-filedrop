@@ -10,7 +10,11 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ConnectionTuning:
-    default_iterations: int = 200_000
+    # OWASP-рекомендація для PBKDF2-HMAC-SHA256 (>=600_000); докладніше: dev-notes.md.
+    default_iterations: int = 600_000
+    # Нижня межа для iterations, отриманих ІЗ ЧУЖОГО пакета (parse_handshake_packet) —
+    # захист від підробленого/зниженого значення, що змусило б слабшу деривацію.
+    min_iterations: int = 200_000
     salt_size_bytes: int = 16
     session_id_size_bytes: int = 8
     fingerprint_hex_length: int = 8

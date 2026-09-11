@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 import _pathfix  # noqa: F401  (додає src/ у sys.path перед наступними імпортами)
 
@@ -194,6 +195,131 @@ class InvalidSendDirTests(AppearanceTestCase):
 
     def test_no_selection_made(self):
         self.assertIsNone(self.app.selected_path)
+
+
+class ChannelEventHandlingTests(AppearanceTestCase):
+    """_handle_channel_event — регресія знайдених security/code-ревʼю багів:
+    канал має явно позначатись розірваним при помилці прийому/закритті, не
+    лишатись "Підтверджено" мовчки. Докладніше: docs/dev-notes.md →
+    "appearance.py: receive_error / receive_closed"."""
+
+    def _mark_connected(self):
+        self.app._handle_channel_event(
+            {"kind": "connected", "socket": object(), "key": b"k" * 32}
+        )
+
+    def test_connected_marks_channel_verified(self):
+        self._mark_connected()
+        self.assertTrue(self.app.channel_verified)
+
+    def test_receive_error_marks_channel_unverified_and_updates_status(self):
+        self._mark_connected()
+        self.app._handle_channel_event({"kind": "receive_error", "error": "boom"})
+        self.assertFalse(self.app.channel_verified)
+        self.assertIn("розірвано", self.app.var_channel_status.get())
+
+    def test_receive_closed_marks_channel_unverified_and_updates_status(self):
+        self._mark_connected()
+        self.app._handle_channel_event({"kind": "receive_closed"})
+        self.assertFalse(self.app.channel_verified)
+        self.assertIn("закрила з'єднання", self.app.var_channel_status.get())
+
+    def test_receive_error_disables_send_button(self):
+        self._mark_connected()
+        self.app.transfer_payload = ["dummy.txt"]
+        self.app._update_send_button_state()
+        self.assertEqual(str(self.app.btn_send["state"]), "normal")
+
+        self.app._handle_channel_event({"kind": "receive_error", "error": "boom"})
+        self.assertEqual(str(self.app.btn_send["state"]), "disabled")
+
+    def test_send_error_reenables_send_button(self):
+        self.app.btn_send.configure(state="disabled")
+        self.app._handle_channel_event({"kind": "send_error", "error": "boom"})
+        self.assertEqual(str(self.app.btn_send["state"]), "normal")
+
+    def test_send_done_reenables_send_button(self):
+        self.app.btn_send.configure(state="disabled")
+        self.app._handle_channel_event({"kind": "send_done", "count": 1})
+        self.assertEqual(str(self.app.btn_send["state"]), "normal")
+
+
+class WorkerBroadExceptionTests(AppearanceTestCase):
+    """Фонові воркери мають репортувати ЛЮБУ помилку в чергу, не лише очікувані
+    типи (KeyError/FileNotFoundError/ET.ParseError тощо тихо вбивали потік —
+    знайдено code-ревʼю). Докладніше: docs/dev-notes.md → "appearance.py:
+    _receive_worker / _send_worker / _channel_establish_worker /
+    _connection_setup_worker — широкий except Exception"."""
+
+    def setUp(self):
+        super().setUp()
+        self.app.channel_socket = object()
+        self.app.channel_key = b"k" * 32
+
+    def test_receive_worker_reports_unexpected_exception(self):
+        import appearance as appearance_module
+
+        with mock.patch.object(
+            appearance_module, "receive_files", side_effect=KeyError("name")
+        ):
+            self.app._receive_worker()
+
+        event = self.app._channel_queue.get_nowait()
+        self.assertEqual(event["kind"], "receive_error")
+        self.assertIn("KeyError", event["error"])
+
+    def test_send_worker_reports_unexpected_exception(self):
+        import appearance as appearance_module
+
+        with mock.patch.object(
+            appearance_module, "send_files", side_effect=FileNotFoundError("gone.txt")
+        ):
+            self.app._send_worker("/tmp", ["gone.txt"])
+
+        event = self.app._channel_queue.get_nowait()
+        self.assertEqual(event["kind"], "send_error")
+        self.assertIn("FileNotFoundError", event["error"])
+
+    def test_channel_establish_worker_reports_unexpected_connect_exception(self):
+        import appearance as appearance_module
+
+        with mock.patch.object(
+            appearance_module, "establish_connection", side_effect=RuntimeError("weird")
+        ):
+            self.app._channel_establish_worker(b"k" * 32)
+
+        event = self.app._channel_queue.get_nowait()
+        self.assertEqual(event["kind"], "connection_failed")
+        self.assertIn("RuntimeError", event["error"])
+
+    def test_channel_establish_worker_reports_unexpected_verify_exception(self):
+        import appearance as appearance_module
+
+        dummy_socket = mock.MagicMock()
+        with mock.patch.object(
+            appearance_module, "establish_connection", return_value=dummy_socket
+        ), mock.patch.object(
+            appearance_module, "verify_channel", side_effect=RuntimeError("weird")
+        ):
+            self.app._channel_establish_worker(b"k" * 32)
+
+        event = self.app._channel_queue.get_nowait()
+        self.assertEqual(event["kind"], "verification_failed")
+        self.assertIn("RuntimeError", event["error"])
+        dummy_socket.close.assert_called_once()
+
+    def test_connection_setup_worker_falls_back_on_unexpected_exception(self):
+        """Побита XML-відповідь роутера (ET.ParseError) чи будь-яка інша
+        неочікувана помилка не має лишити чергу порожньою назавжди."""
+        import appearance as appearance_module
+
+        with mock.patch.object(
+            appearance_module, "detect_local_address", side_effect=RuntimeError("weird")
+        ):
+            self.app._connection_setup_worker(52075)
+
+        result = self.app._conn_setup_queue.get_nowait()
+        self.assertIsNone(result.get("source"))
 
 
 if __name__ == "__main__":
