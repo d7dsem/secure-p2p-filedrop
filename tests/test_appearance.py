@@ -197,6 +197,28 @@ class InvalidSendDirTests(AppearanceTestCase):
         self.assertIsNone(self.app.selected_path)
 
 
+class GeneratePassphraseTests(AppearanceTestCase):
+    """Кнопка "Згенерувати" (парольна фраза) — dev-notes.md → "on_generate_passphrase"."""
+
+    def test_fills_non_empty_passphrase(self):
+        self.app.on_generate_passphrase()
+        self.assertTrue(self.app.var_passphrase.get())
+
+    def test_two_generations_differ(self):
+        self.app.on_generate_passphrase()
+        first = self.app.var_passphrase.get()
+        self.app.on_generate_passphrase()
+        second = self.app.var_passphrase.get()
+        self.assertNotEqual(first, second)
+
+    def test_reveals_passphrase_after_generating(self):
+        self.app.var_show_pass.set(False)
+        self.app._toggle_pass_visibility()
+        self.app.on_generate_passphrase()
+        self.assertTrue(self.app.var_show_pass.get())
+        self.assertEqual(str(self.app.entry_passphrase["show"]), "")
+
+
 class ChannelEventHandlingTests(AppearanceTestCase):
     """_handle_channel_event — регресія знайдених security/code-ревʼю багів:
     канал має явно позначатись розірваним при помилці прийому/закритті, не

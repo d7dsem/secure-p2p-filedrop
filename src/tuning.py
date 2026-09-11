@@ -15,6 +15,9 @@ class ConnectionTuning:
     # Нижня межа для iterations, отриманих ІЗ ЧУЖОГО пакета (parse_handshake_packet) —
     # захист від підробленого/зниженого значення, що змусило б слабшу деривацію.
     min_iterations: int = 200_000
+    # secrets.token_urlsafe(n) з n байт сирої ентропії — ~192 біти, з великим запасом
+    # над рекомендаціями (напр. EFF diceware 6 слів ~77 біт).
+    generated_passphrase_bytes: int = 24
     salt_size_bytes: int = 16
     session_id_size_bytes: int = 8
     fingerprint_hex_length: int = 8
@@ -63,7 +66,7 @@ class ProfileTuning:
 class AppearanceTuning:
     window_title: str = "Обмін файлами — підготовка сеансу"
     # Ширший дефолт під двоколонковий layout — старий 640x720 не вміщав дерево файлів.
-    window_geometry: str = "900x750"
+    window_geometry: str = "900x825"
     window_min_size: tuple[int, int] = (760, 520)
     text_widget_height: int = 6
     base_font_size_delta: int = 1  # наскільки збільшити системний дефолт (дрібний за замовчуванням)

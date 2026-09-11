@@ -7,6 +7,7 @@
 import base64
 import os
 import queue
+import secrets
 import threading
 import time
 import tkinter as tk
@@ -41,6 +42,25 @@ _ENCRYPTION_LEVEL_LABELS = {
     EncryptionLevel.AES256: "AES-256",
 }
 _ENCRYPTION_LABEL_TO_LEVEL = {label: level for level, label in _ENCRYPTION_LEVEL_LABELS.items()}
+
+_HELP_TEXT = """Як користуватись
+
+1. Обидві сторони вводять ОДНАКОВУ парольну фразу (не передається мережею) — або одна сторона тисне "Згенерувати" й передає готову фразу іншій тим самим каналом, що й хендшейк.
+2. Сторона A: "Згенерувати хендшейк" → копіює текст → надсилає стороні B через месенджер (Signal/Telegram тощо).
+3. Сторона B: вставляє отриманий текст → "Обробити вхідний хендшейк".
+4. Обидві сторони звіряють короткий код підтвердження (голосом/текстом через той самий месенджер) — мають збігатись.
+5. З'єднання встановлюється й підтверджується автоматично (UPnP → STUN → LAN), без додаткових дій.
+6. Оберіть файл або каталог, за потреби — архівування/шифрування/стиснення → "Ініціалізувати передачу" → "Надіслати".
+
+Особливості безпеки
+
+- Вміст файлів завжди шифрується (AES-256-CTR); ключ ніколи не передається мережею.
+- Без TLS: ім'я файлу, розмір і контрольна сума видно спостерігачу в мережі — прихований лише вміст.
+- Немає центрального сервера чи relay: якщо обидві сторони за суворим NAT без UPnP, з'єднання не встановиться.
+- Уся безпека тримається на силі парольної фрази — коротку фразу можна підібрати офлайн навіть з коректною деривацією ключа.
+- Хендшейк-пакет не містить пароля, лише службові дані (сіль, sid, host/port) — сам собою він не розкриває ключ.
+
+Детальніше: docs/concept.md ("Безпека — обмеження та гарантії") і docs/dev-notes.md у репозиторії проєкту."""
 
 
 class SecureFileClientApp:
@@ -220,6 +240,21 @@ class SecureFileClientApp:
             highlightthickness=0, borderwidth=0,
         )
 
+    def _make_readonly_selectable(self, text_widget) -> None:
+        """Текст лишається виділюваним/копійованим (Ctrl+C, виділення мишею), але без
+        редагування — на відміну від state="disabled", який у Tk блокує й виділення теж.
+        Докладніше: docs/dev-notes.md → "appearance.py: _make_readonly_selectable"."""
+        navigation_keys = {"Left", "Right", "Up", "Down", "Prior", "Next", "Home", "End", "Tab"}
+
+        def _block_edit(event):
+            if event.keysym in navigation_keys:
+                return None
+            if event.state & 0x4 and event.keysym.lower() in ("c", "a", "insert"):
+                return None  # Ctrl+C / Ctrl+A / Ctrl+Insert — копіювання, дозволено
+            return "break"
+
+        text_widget.bind("<Key>", _block_edit)
+
     def _make_reserved_label(self, parent, text: str, wraplength: int, height: int, **pack_kwargs) -> ttk.Label:
         """Label у Frame фіксованої висоти — щоб ріст тексту (1->N рядків) не двигав вікно.
         Докладніше: docs/dev-notes.md → "appearance.py: _make_reserved_label"."""
@@ -241,13 +276,16 @@ class SecureFileClientApp:
         tab_session = ttk.Frame(self.notebook)
         tab_profile = ttk.Frame(self.notebook)
         tab_log = ttk.Frame(self.notebook)
+        tab_help = ttk.Frame(self.notebook)
         self.notebook.add(tab_session, text="Сеанс")
         self.notebook.add(tab_profile, text="Профіль")
         self.notebook.add(tab_log, text="Консоль / Лог")
+        self.notebook.add(tab_help, text="Довідка")
 
         self._build_session_tab(tab_session)
         self._build_profile_tab(tab_profile, pad)
         self._build_log_tab(tab_log, pad)
+        self._build_help_tab(tab_help, pad)
 
         # --- Статус (спільний для всіх вкладок) ---
         self.var_status = tk.StringVar(value="Готово.")
@@ -316,6 +354,9 @@ class SecureFileClientApp:
         self._make_checkbutton(
             frame_params, "Показати", self.var_show_pass, self._toggle_pass_visibility
         ).grid(row=0, column=4, sticky="w", padx=(0, 8), pady=(8, 4))
+        ttk.Button(frame_params, text="Згенерувати", command=self.on_generate_passphrase).grid(
+            row=0, column=5, sticky="w", padx=(0, 8), pady=(8, 4)
+        )
 
         ttk.Label(frame_params, text="Ітерацій:").grid(
             row=1, column=0, sticky="w", padx=8, pady=(0, 8)
@@ -496,6 +537,14 @@ class SecureFileClientApp:
             side="left", padx=8
         )
 
+        # Прогрес поточної передачі (send_progress/receive_progress з transport.py через чергу).
+        progress_row = ttk.Frame(frame_file)
+        progress_row.pack(fill="x", padx=8, pady=(0, 8))
+        self.var_progress_text = tk.StringVar(value="")
+        ttk.Label(progress_row, textvariable=self.var_progress_text, wraplength=520).pack(anchor="w")
+        self.progress_bar = ttk.Progressbar(progress_row, orient="horizontal", mode="determinate", maximum=100)
+        self.progress_bar.pack(fill="x", pady=(2, 0))
+
     def _build_profile_tab(self, parent: ttk.Frame, pad: dict):
         """local_config.py: client_id + дефолтні каталоги. На диск — лише по кнопці "Зберегти профіль"."""
         frame_id = ttk.LabelFrame(parent, text="Ідентифікатор клієнта")
@@ -545,24 +594,40 @@ class SecureFileClientApp:
         btns_log.pack(fill="x", **pad)
         ttk.Button(btns_log, text="Очистити", command=self._clear_log).pack(side="left")
 
-        self.text_log = scrolledtext.ScrolledText(parent, wrap="word", state="disabled")
+        self.text_log = scrolledtext.ScrolledText(parent, wrap="word")
         self.text_log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self._style_text_widget(self.text_log)
+        # Не state="disabled" — це в Tk блокує й виділення мишею, не лише редагування.
+        self._make_readonly_selectable(self.text_log)
 
     def _log(self, message: str):
         timestamp = time.strftime("%H:%M:%S")
-        self.text_log.configure(state="normal")
         self.text_log.insert("end", f"[{timestamp}] {message}\n")
         self.text_log.see("end")
-        self.text_log.configure(state="disabled")
 
     def _clear_log(self):
-        self.text_log.configure(state="normal")
         self.text_log.delete("1.0", "end")
-        self.text_log.configure(state="disabled")
+
+    def _build_help_tab(self, parent: ttk.Frame, pad: dict):
+        """Лаконічна довідка: кроки використання + ключові особливості безпеки.
+        Докладніше: docs/concept.md, docs/dev-notes.md."""
+        text = scrolledtext.ScrolledText(parent, wrap="word")
+        text.pack(fill="both", expand=True, padx=10, pady=10)
+        self._style_text_widget(text)
+        text.insert("end", _HELP_TEXT)
+        self._make_readonly_selectable(text)
 
     def _toggle_pass_visibility(self):
         self.entry_passphrase.configure(show="" if self.var_show_pass.get() else "*")
+
+    def on_generate_passphrase(self):
+        """Замінює поле парольної фрази криптографічно випадковою (secrets, не random) —
+        передати іншій стороні тим самим захищеним каналом, що й хендшейк."""
+        self.var_passphrase.set(secrets.token_urlsafe(CONNECTION.generated_passphrase_bytes))
+        self.var_show_pass.set(True)
+        self._toggle_pass_visibility()
+        self._set_status("Парольну фразу згенеровано — скопіюйте й передайте іншій стороні.")
+        self._log("Згенеровано нову парольну фразу.")
 
     def _on_encryption_level_change(self, *_args):
         """AES128/256 без архіву не має сенсу — авто-вмикаємо архівування при виборі AES."""
@@ -721,10 +786,7 @@ class SecureFileClientApp:
             )
         else:
             self.var_channel_status.set(f"Слухаю на порту {self.local_port} — чекаю на іншу сторону...")
-            self._log(
-                f"Канал передачі: слухаю на порту {self.local_port} (адреса іншої сторони ще "
-                f"невідома — так і має бути для того боку, хто згенерував хендшейк)."
-            )
+            self._log(f"Канал передачі: слухаю на порту {self.local_port}, чекаю підключення.")
         threading.Thread(target=self._channel_establish_worker, args=(session_key,), daemon=True).start()
 
     def _channel_establish_worker(self, session_key: bytes):
@@ -787,6 +849,10 @@ class SecureFileClientApp:
             self._update_send_button_state()
             threading.Thread(target=self._receive_worker, daemon=True).start()
 
+        elif kind == "receive_progress":
+            self.progress_bar["value"] = event["pct"]
+            self.var_progress_text.set(f"Приймаю: {event['name']} — {event['pct']}%")
+
         elif kind == "receive_done":
             names = ", ".join(os.path.basename(p) for p in event["files"])
             self._set_status(f"Отримано {len(event['files'])} файл(и/ів): {names}")
@@ -794,6 +860,8 @@ class SecureFileClientApp:
                 f"Канал передачі: отримано {len(event['files'])} файл(и/ів) у "
                 f"{self.profile.incoming_dir}: {names}."
             )
+            self.progress_bar["value"] = 100
+            self.var_progress_text.set(f"Отримано {len(event['files'])} файл(и/ів).")
 
         elif kind == "receive_error":
             # Прийом на цій стороні зупинено назавжди (dev-notes.md) — канал більше
@@ -809,23 +877,43 @@ class SecureFileClientApp:
             self._log("Канал передачі: інша сторона закрила з'єднання.")
             self._update_send_button_state()
 
+        elif kind == "send_progress":
+            self.progress_bar["value"] = event["pct"]
+            self.var_progress_text.set(f"Надсилаю: {event['name']} — {event['pct']}%")
+
         elif kind == "send_done":
             self.var_transfer_status.set(f"Надіслано {event['count']} файл(и/ів).")
             self._set_status(f"Надіслано {event['count']} файл(и/ів).")
             self._log(f"Канал передачі: надіслано {event['count']} файл(и/ів).")
+            self.progress_bar["value"] = 100
+            self.var_progress_text.set(f"Надіслано {event['count']} файл(и/ів).")
             self.btn_send.configure(state="normal")
 
         elif kind == "send_error":
             self.var_transfer_status.set(f"Помилка надсилання: {event['error']}")
             self._log(f"Канал передачі: помилка надсилання — {event['error']}")
+            self.progress_bar["value"] = 0
+            self.var_progress_text.set("")
             self.btn_send.configure(state="normal")
 
     def _receive_worker(self):
         """Фоновий потік: приймає файли в profile.incoming_dir, доки інша сторона
         не закриє з'єднання. Цикл — щоб приймати кілька послідовних передач за сеанс."""
+        # Без агрегованого прогресу (на відміну від send) — receive_files не знає
+        # загальної кількості/розміру файлів наперед, лише поточний.
+        last_pct = {"value": -1}
+
+        def on_progress(rel_path: str, done: int, total: int):
+            pct = int(done * 100 / total) if total else 100
+            if pct != last_pct["value"]:
+                last_pct["value"] = pct
+                self._channel_queue.put({"kind": "receive_progress", "name": rel_path, "pct": pct})
+
         while True:
             try:
-                received = receive_files(self.channel_socket, self.channel_key, self.profile.incoming_dir)
+                received = receive_files(
+                    self.channel_socket, self.channel_key, self.profile.incoming_dir, on_progress=on_progress
+                )
                 self._channel_queue.put({"kind": "receive_done", "files": received})
             except PeerClosed:
                 self._channel_queue.put({"kind": "receive_closed"})
@@ -859,6 +947,8 @@ class SecureFileClientApp:
             return
 
         self.btn_send.configure(state="disabled")
+        self.progress_bar["value"] = 0
+        self.var_progress_text.set("")
         self.var_transfer_status.set(f"Надсилаю {len(self.transfer_payload)} файл(и/ів)...")
         self._set_status("Надсилаю файли...")
         self._log(f"Надсилання {len(self.transfer_payload)} файл(и/ів)...")
@@ -867,8 +957,23 @@ class SecureFileClientApp:
         ).start()
 
     def _send_worker(self, root_dir: str, files: list):
+        # Агрегований прогрес по всіх файлах разом (розмір відомий заздалегідь — на
+        # відміну від прийому, де файли йдуть потоком без наперед відомого підсумку).
+        progress = {"prev_name": None, "bytes_before_current": 0, "prev_total": 0, "last_pct": -1}
+
+        def on_progress(rel_path: str, done: int, total: int):
+            if rel_path != progress["prev_name"]:
+                progress["bytes_before_current"] += progress["prev_total"]
+                progress["prev_name"] = rel_path
+                progress["prev_total"] = total
+            pct = int((progress["bytes_before_current"] + done) * 100 / total_bytes)
+            if pct != progress["last_pct"]:
+                progress["last_pct"] = pct
+                self._channel_queue.put({"kind": "send_progress", "name": rel_path, "pct": pct})
+
         try:
-            send_files(self.channel_socket, self.channel_key, root_dir, files)
+            total_bytes = sum(os.path.getsize(f) for f in files) or 1
+            send_files(self.channel_socket, self.channel_key, root_dir, files, on_progress=on_progress)
             self._channel_queue.put({"kind": "send_done", "count": len(files)})
         except TransportError as e:
             self._channel_queue.put({"kind": "send_error", "error": str(e)})
@@ -957,10 +1062,8 @@ class SecureFileClientApp:
                 f"STUN: успіх — {self.public_host}:{self.public_port} (порт не прокинуто автоматично)"
             )
             self._log(
-                f"Мережеві налаштування (рівень 2, STUN) — успіх: публічна адреса "
-                f"{self.public_host}:{self.public_port}. УВАГА: на відміну від UPnP, порт тут НЕ "
-                f"прокинуто — це працює, лише поки живий NAT-мапінг від цього запиту "
-                f"(типово секунди-хвилини), без гарантії."
+                f"Мережеві налаштування (рівень 2, STUN) — успіх: {self.public_host}:{self.public_port} "
+                f"(порт не прокинуто)."
             )
             return
 
@@ -970,10 +1073,7 @@ class SecureFileClientApp:
         self.var_conn_status.set(
             "UPnP і STUN не спрацювали — буде використано локальну адресу (LAN-only)."
         )
-        self._log(
-            "Мережеві налаштування: обидва рівні не спрацювали (типово symmetric NAT/CGNAT або "
-            "суворий фаєрвол) — хендшейк генеруватиметься з локальною LAN-адресою."
-        )
+        self._log("Мережеві налаштування: UPnP і STUN не спрацювали — LAN-only.")
 
     def on_choose_file(self):
         path = filedialog.askopenfilename(
@@ -1164,8 +1264,7 @@ class SecureFileClientApp:
             self._set_status(f"Готово до передачі: архів з {len(included_files)} файл(и/ів).")
             self._log(
                 f"Ініціалізація передачі: запаковано {len(included_files)} файл(и/ів) у {archive_path} "
-                f"({compress_kind}, {encryption_kind}; технічна підпапка {EXCHANGE.pack_subdir_name}, "
-                f"не входить у вибір)."
+                f"({compress_kind}, {encryption_kind})."
             )
         else:
             self.packed_archive_path = None
