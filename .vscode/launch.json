@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Secure File Client (GUI)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/secure_file_client.py",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
