@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Точка входу застосунку.
+
+Логіка розбита по шарах відповідальності (докладніше — docs/concept.md):
+  - connection.py — деривація ключа й хендшейк ("підключення");
+  - nat_traversal.py / stun_client.py — UPnP і STUN, теж "підключення";
+  - local_config.py — персистентний профіль користувача ("профіль");
+  - appearance.py — tkinter GUI ("зовнішність");
+  - exchange.py — підготовка даних до передачі ("обмін");
+  - tuning.py — конфігураційні параметри (датакласи), без магічних констант.
+
+Залежності: лише стандартна бібліотека Python (tkinter, hashlib, json,
+base64, secrets, zipfile, os, tempfile, socket, struct, urllib, xml,
+argparse, pathlib). Кросплатформенно (Windows/macOS/Linux), за умови що
+Python зібраний з Tk (стандартно для офіційних дистрибутивів).
+"""
+
+import argparse
+import tkinter as tk
+from tkinter import ttk
+
+from appearance import SecureFileClientApp
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """argv=None означає "взяти з sys.argv" (звичайний запуск); явний список
+    зручний для тестів — не потребує підміни sys.argv."""
+    parser = argparse.ArgumentParser(description="Secure P2P FileDrop — GUI-клієнт")
+    parser.add_argument(
+        "--pswd", "-p", dest="passphrase", type=str, default=None,
+        help="Парольна фраза, якою одразу заповнити поле в GUI (зручно для дебагу; "
+             "у звичайному використанні пароль краще вводити вручну).",
+    )
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
+    root = tk.Tk()
+    try:
+        style = ttk.Style()
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+    except Exception:
+        pass
+    app = SecureFileClientApp(root, initial_passphrase=args.passphrase)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git branch*)",
+      "Bash(git remote*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(pip install*)",
+      "Bash(pip list*)",
+      "Bash(pip show*)",
+      "Bash(gh auth status*)",
+      "Bash(gh repo view*)",
+      "Bash(gh pr view*)",
+      "Bash(gh pr list*)"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)",
+      "Bash(rm -rf*)"
+    ]
+  }
+}
