@@ -59,7 +59,7 @@ class ProfileTuning:
 class AppearanceTuning:
     window_title: str = "Обмін файлами — підготовка сеансу"
     # Ширший дефолт під двоколонковий layout — старий 640x720 не вміщав дерево файлів.
-    window_geometry: str = "900x860"
+    window_geometry: str = "900x750"
     window_min_size: tuple[int, int] = (760, 520)
     text_widget_height: int = 6
     base_font_size_delta: int = 1  # наскільки збільшити системний дефолт (дрібний за замовчуванням)
@@ -100,6 +100,25 @@ class EncryptionTuning:
     aes256_bits: int = 256
 
 
+@dataclass(frozen=True)
+class TransportTuning:
+    """Шар "транспорт" (Фаза 3 + сервісна функція, docs/concept.md): сокети,
+    протокол підтвердження ключа (HMAC challenge-response), передача файлів."""
+    connect_retry_interval_seconds: float = 0.5
+    # Реалістично велике: сторона, що згенерувала хендшейк, чекає, поки людина
+    # скопіює його, надішле іншому месенджером, а той вставить і обробить —
+    # це хвилини, не секунди. Тести самі передають короткий timeout явно.
+    connect_timeout_seconds: float = 300.0
+    listen_backlog: int = 1
+    accept_poll_timeout_seconds: float = 0.5  # для періодичної перевірки stop_event
+    verify_timeout_seconds: float = 5.0
+    nonce_size_bytes: int = 16
+    chunk_size_bytes: int = 65536
+    frame_length_bytes: int = 4  # big-endian префікс довжини кадру
+    max_frame_bytes: int = 64 * 1024 * 1024  # запобіжник від OOM на побитому/ворожому кадрі
+    aes_nonce_bytes: int = 16
+
+
 CONNECTION = ConnectionTuning()
 NAT = NatTuning()
 STUN = StunTuning()
@@ -107,3 +126,4 @@ PROFILE = ProfileTuning()
 APPEARANCE = AppearanceTuning()
 EXCHANGE = ExchangeTuning()
 ENCRYPTION = EncryptionTuning()
+TRANSPORT = TransportTuning()

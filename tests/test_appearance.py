@@ -38,8 +38,13 @@ class AppearanceTestCase(unittest.TestCase):
         self.root.withdraw()
         self.addCleanup(self.root.destroy)
 
+        self.app = self._create_app()
+
+    def _create_app(self):
+        """Гачок для підкласів, яким потрібні інші аргументи конструктора
+        (напр. initial_send_dir)."""
         from appearance import SecureFileClientApp
-        self.app = SecureFileClientApp(self.root)
+        return SecureFileClientApp(self.root)
 
     def _patch_env(self, name: str, value: str):
         old = os.environ.get(name)
@@ -150,6 +155,45 @@ class ArchiveVsAsIsChoiceTests(AppearanceTestCase):
 
         self.assertEqual(self.app.transfer_payload, [file_path])
         self.assertIsNone(self.app.packed_archive_path)
+
+
+class InitialSendDirTests(AppearanceTestCase):
+    """initial_send_dir (--snd-dir у CLI) — одразу обирає каталог, як після
+    "Обрати каталог...", без діалогового вікна."""
+
+    def setUp(self):
+        self.send_dir = tempfile.mkdtemp(prefix="test_appearance_snd_dir_")
+        self.addCleanup(shutil.rmtree, self.send_dir, ignore_errors=True)
+        with open(os.path.join(self.send_dir, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("a")
+        super().setUp()
+
+    def _create_app(self):
+        from appearance import SecureFileClientApp
+        return SecureFileClientApp(self.root, initial_send_dir=self.send_dir)
+
+    def test_directory_preselected(self):
+        self.assertEqual(self.app.selected_path, self.send_dir)
+        self.assertTrue(self.app.selected_is_dir)
+
+    def test_tree_populated_with_directory_contents(self):
+        self.assertIn("a.txt", self.app.tree_files.get_children(""))
+
+    def test_transfer_button_enabled(self):
+        self.assertEqual(str(self.app.btn_transfer["state"]), "normal")
+
+
+class InvalidSendDirTests(AppearanceTestCase):
+    """Неіснуючий шлях у initial_send_dir не має падати — лише запис у лог."""
+
+    def _create_app(self):
+        from appearance import SecureFileClientApp
+        return SecureFileClientApp(
+            self.root, initial_send_dir=os.path.join(tempfile.gettempdir(), "does-not-exist-xyz")
+        )
+
+    def test_no_selection_made(self):
+        self.assertIsNone(self.app.selected_path)
 
 
 if __name__ == "__main__":

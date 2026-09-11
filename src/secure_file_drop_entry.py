@@ -20,6 +20,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Парольна фраза, якою одразу заповнити поле в GUI (зручно для дебагу; "
              "у звичайному використанні пароль краще вводити вручну).",
     )
+    parser.add_argument(
+        "--snd-dir", dest="send_dir", type=str, default=None,
+        help="Каталог, який одразу обрати для передачі (як після 'Обрати каталог...').",
+    )
     return parser.parse_args(argv)
 
 
@@ -32,7 +36,7 @@ def main():
             style.theme_use("clam")
     except Exception:
         pass
-    app = SecureFileClientApp(root, initial_passphrase=args.passphrase)
+    app = SecureFileClientApp(root, initial_passphrase=args.passphrase, initial_send_dir=args.send_dir)
     root.mainloop()
 
 

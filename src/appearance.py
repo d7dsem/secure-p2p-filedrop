@@ -19,6 +19,10 @@ from exchange import EncryptionLevel, build_archive_from_selection, format_size,
 from local_config import LocalConfig, config_path, load_config, save_config
 from nat_traversal import UpnpError, try_configure_port_forwarding
 from stun_client import StunError, get_public_address
+from transport import (
+    ConnectionFailed, PeerClosed, TransportError, VerificationError,
+    establish_connection, receive_files, send_files, verify_channel,
+)
 from tuning import APPEARANCE, CONNECTION, ENCRYPTION, EXCHANGE, STUN
 
 _TREE_LOADING_SUFFIX = "/__loading__"
@@ -40,7 +44,7 @@ _ENCRYPTION_LABEL_TO_LEVEL = {label: level for level, label in _ENCRYPTION_LEVEL
 
 
 class SecureFileClientApp:
-    def __init__(self, root: tk.Tk, initial_passphrase: str | None = None):
+    def __init__(self, root: tk.Tk, initial_passphrase: str | None = None, initial_send_dir: str | None = None):
         self.root = root
         self.root.title(APPEARANCE.window_title)
         self.root.geometry(APPEARANCE.window_geometry)
@@ -58,7 +62,14 @@ class SecureFileClientApp:
         self.selected_path: str | None = None
         self.selected_is_dir: bool = False
         self.packed_archive_path: str | None = None  # окремо від selected_path — див. dev-notes.md
-        self.transfer_payload: list[str] | None = None  # фінальний payload для майбутньої Фази 3
+        self.transfer_payload: list[str] | None = None  # фінальний payload для передачі
+
+        self.local_port: int | None = None  # локальний порт, на якому реально слухаємо (не public_port)
+        self.channel_socket = None  # встановлений і підтверджений сокет (transport.py) або None
+        self.channel_key: bytes | None = None  # сесійний ключ, яким верифіковано ЦЕЙ канал — dev-notes.md
+        self.channel_verified: bool = False
+        self._channel_thread_started: bool = False
+        self._channel_queue: queue.Queue = queue.Queue()
 
         # rel_path (POSIX "/") -> чи включено; дефолт — усе включено (запис лише при зміні).
         self._file_tree_checked: dict[str, bool] = {}
@@ -80,8 +91,25 @@ class SecureFileClientApp:
         if initial_passphrase:
             self.var_passphrase.set(initial_passphrase)
 
+        if initial_send_dir:
+            if os.path.isdir(initial_send_dir):
+                self._select_send_dir(initial_send_dir)
+            else:
+                self._log(f"--snd-dir: '{initial_send_dir}' не є каталогом — проігноровано.")
+
         # Автоматично, без кнопки (docs/concept.md); в кінці __init__ — усе вже побудовано.
         self._start_connection_setup()
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(200, self._poll_channel_events)
+
+    def _on_close(self):
+        if self.channel_socket is not None:
+            try:
+                self.channel_socket.close()
+            except OSError:
+                pass
+        self.root.destroy()
 
     def _set_window_icon(self):
         """assets/icon.ico (Windows) + assets/icon.png (крос-платформенно через stdlib
@@ -361,6 +389,17 @@ class SecureFileClientApp:
             frame_in, "Код підтвердження ключа: —", wraplength=340, height=40, padx=8, pady=(0, 4)
         )
 
+        # --- Секція: канал передачі — автоматично, щойно відомі local_key і
+        # адреса іншої сторони (після generate + process incoming, у будь-якому
+        # порядку). Сервісна функція з docs/concept.md: establish + HMAC-звірка.
+        frame_channel = ttk.LabelFrame(parent, text="Канал передачі")
+        frame_channel.pack(fill="x", **pad)
+        self.var_channel_status = tk.StringVar(value="Очікування хендшейку з обох сторін...")
+        channel_label = self._make_reserved_label(
+            frame_channel, "", wraplength=340, height=40, padx=8, pady=8,
+        )
+        channel_label.configure(textvariable=self.var_channel_status)
+
     def _build_session_right(self, parent: ttk.Frame):
         pad = {"padx": 10, "pady": 6}
 
@@ -445,8 +484,15 @@ class SecureFileClientApp:
             command=self.on_initiate_transfer, state="disabled",
         )
         self.btn_transfer.pack(side="left")
+        # "Надіслати" — активна лише коли і payload готовий (Ініціалізувати передачу),
+        # і канал підтверджений (transport.verify_channel) — див. _update_send_button_state.
+        self.btn_send = ttk.Button(
+            btns_transfer, text="Надіслати", style="Accent.TButton",
+            command=self.on_send_files, state="disabled",
+        )
+        self.btn_send.pack(side="left", padx=8)
         self.var_transfer_status = tk.StringVar(value="")
-        ttk.Label(btns_transfer, textvariable=self.var_transfer_status, wraplength=420).pack(
+        ttk.Label(btns_transfer, textvariable=self.var_transfer_status, wraplength=340).pack(
             side="left", padx=8
         )
 
@@ -576,6 +622,7 @@ class SecureFileClientApp:
         self.local_salt = salt
         self.local_session_id = session_id
         self.local_key = derive_key(passphrase, salt, iterations)
+        self.local_port = port  # порт, на якому РЕАЛЬНО слухатимемо (не effective_port — dev-notes.md)
 
         self.text_out.configure(state="normal")
         self.text_out.delete("1.0", "end")
@@ -592,6 +639,7 @@ class SecureFileClientApp:
             f"Хендшейк згенеровано: sid={session_id}, net={host}:{effective_port} ({host_kind}), "
             f"iter={iterations}."
         )
+        self._maybe_start_channel_establishment()
 
     def on_copy_handshake(self):
         content = self.text_out.get("1.0", "end").strip()
@@ -634,6 +682,173 @@ class SecureFileClientApp:
             f"Вхідний хендшейк оброблено: sid={packet['sid']}, "
             f"net={self.peer_host}:{self.peer_port}, iter={iterations}."
         )
+        self._maybe_start_channel_establishment()
+
+    # ---- канал передачі (сервісна функція + Фаза 3, transport.py) --------
+
+    def _session_key(self) -> bytes | None:
+        """Спільний сесійний ключ ЦІЄЇ сторони. Хто ЗГЕНЕРУВАВ хендшейк — його ключ
+        у local_key; хто лише ОБРОБИВ чужий вхідний хендшейк — ключ у peer_key
+        (дерivований із salt іншої сторони). peer_key має пріоритет: обробка чужого
+        хендшейку — явна дія "приєднатись до сеансу іншої сторони"."""
+        return self.peer_key if self.peer_key is not None else self.local_key
+
+    def _maybe_start_channel_establishment(self):
+        """Стартує встановлення каналу, щойно відомий сесійний ключ. peer_host/
+        peer_port — опційні: за протоколом docs/concept.md хендшейк ділиться лише
+        в один бік, тому сторона, яка його ЗГЕНЕРУВАЛА, зазвичай не знає адреси
+        іншої сторони — вона просто слухає (establish_connection у режимі
+        "лише слухати"); сторона, яка ОБРОБИЛА вхідний хендшейк, знає адресу
+        (peer_host/peer_port) і підключається сама. Один раз за сеанс."""
+        if self._channel_thread_started:
+            return
+        session_key = self._session_key()
+        if session_key is None:
+            return
+        local_port = self._get_port()
+        if local_port is None:
+            return
+        self.local_port = local_port
+
+        self._channel_thread_started = True
+        if self.peer_host is not None and self.peer_port is not None:
+            self.var_channel_status.set("Встановлюю з'єднання...")
+            self._log(
+                f"Канал передачі: встановлюю з'єднання з {self.peer_host}:{self.peer_port} "
+                f"(локальний порт {self.local_port})..."
+            )
+        else:
+            self.var_channel_status.set(f"Слухаю на порту {self.local_port} — чекаю на іншу сторону...")
+            self._log(
+                f"Канал передачі: слухаю на порту {self.local_port} (адреса іншої сторони ще "
+                f"невідома — так і має бути для того боку, хто згенерував хендшейк)."
+            )
+        threading.Thread(target=self._channel_establish_worker, args=(session_key,), daemon=True).start()
+
+    def _channel_establish_worker(self, session_key: bytes):
+        """Фоновий потік — жодних звернень до self.root/tkinter, лише мережа й запис у чергу."""
+        try:
+            sock = establish_connection(self.local_port, self.peer_host, self.peer_port)
+        except ConnectionFailed as e:
+            self._channel_queue.put({"kind": "connection_failed", "error": str(e)})
+            return
+        try:
+            verify_channel(sock, session_key)
+        except VerificationError as e:
+            sock.close()
+            self._channel_queue.put({"kind": "verification_failed", "error": str(e)})
+            return
+        self._channel_queue.put({"kind": "connected", "socket": sock, "key": session_key})
+
+    def _poll_channel_events(self):
+        """Персистентний опитувач self._channel_queue — стартує в __init__ і
+        працює весь час роботи застосунку (безпечно, черга здебільшого порожня)."""
+        try:
+            while True:
+                event = self._channel_queue.get_nowait()
+                self._handle_channel_event(event)
+        except queue.Empty:
+            pass
+        self.root.after(200, self._poll_channel_events)
+
+    def _handle_channel_event(self, event: dict):
+        kind = event["kind"]
+
+        if kind == "connection_failed":
+            self.var_channel_status.set("Не вдалось встановити з'єднання.")
+            self._log(f"Канал передачі: {event['error']}")
+
+        elif kind == "verification_failed":
+            self.var_channel_status.set("Ключі НЕ збігаються — звірте код підтвердження вручну.")
+            self._log(f"Канал передачі: {event['error']}")
+            messagebox.showwarning(
+                "Ключі не збігаються",
+                "Підтвердження ключа провалилось — коди підтвердження (у секціях хендшейку "
+                "вище) з обох сторін відрізняються. Типова причина: одруківка в парольній "
+                "фразі. Звірте короткі коди голосом/текстом через месенджер.",
+            )
+
+        elif kind == "connected":
+            self.channel_socket = event["socket"]
+            self.channel_key = event["key"]
+            self.channel_verified = True
+            self.var_channel_status.set("Підтверджено — канал готовий до передачі.")
+            self._log("Канал передачі: ключі підтверджено, з'єднання готове.")
+            self._update_send_button_state()
+            threading.Thread(target=self._receive_worker, daemon=True).start()
+
+        elif kind == "receive_done":
+            names = ", ".join(os.path.basename(p) for p in event["files"])
+            self._set_status(f"Отримано {len(event['files'])} файл(и/ів): {names}")
+            self._log(
+                f"Канал передачі: отримано {len(event['files'])} файл(и/ів) у "
+                f"{self.profile.incoming_dir}: {names}."
+            )
+
+        elif kind == "receive_error":
+            self._log(f"Канал передачі: помилка прийому — {event['error']}")
+
+        elif kind == "receive_closed":
+            self._log("Канал передачі: інша сторона закрила з'єднання.")
+
+        elif kind == "send_done":
+            self.var_transfer_status.set(f"Надіслано {event['count']} файл(и/ів).")
+            self._set_status(f"Надіслано {event['count']} файл(и/ів).")
+            self._log(f"Канал передачі: надіслано {event['count']} файл(и/ів).")
+            self.btn_send.configure(state="normal")
+
+        elif kind == "send_error":
+            self.var_transfer_status.set(f"Помилка надсилання: {event['error']}")
+            self._log(f"Канал передачі: помилка надсилання — {event['error']}")
+            self.btn_send.configure(state="normal")
+
+    def _receive_worker(self):
+        """Фоновий потік: приймає файли в profile.incoming_dir, доки інша сторона
+        не закриє з'єднання. Цикл — щоб приймати кілька послідовних передач за сеанс."""
+        while True:
+            try:
+                received = receive_files(self.channel_socket, self.channel_key, self.profile.incoming_dir)
+                self._channel_queue.put({"kind": "receive_done", "files": received})
+            except PeerClosed:
+                self._channel_queue.put({"kind": "receive_closed"})
+                return
+            except TransportError as e:
+                self._channel_queue.put({"kind": "receive_error", "error": str(e)})
+                return
+
+    def _update_send_button_state(self):
+        ready = self.channel_verified and bool(self.transfer_payload)
+        self.btn_send.configure(state="normal" if ready else "disabled")
+
+    def _transfer_root_dir(self) -> str:
+        if self.packed_archive_path:
+            return os.path.dirname(self.packed_archive_path)
+        if self.selected_is_dir:
+            return self.selected_path
+        return os.path.dirname(self.selected_path)
+
+    def on_send_files(self):
+        if not self.channel_verified or self.channel_socket is None:
+            messagebox.showwarning("Увага", "Канал ще не готовий — зачекайте на підтвердження з'єднання.")
+            return
+        if not self.transfer_payload:
+            messagebox.showwarning("Увага", "Спочатку натисніть «Ініціалізувати передачу».")
+            return
+
+        self.btn_send.configure(state="disabled")
+        self.var_transfer_status.set(f"Надсилаю {len(self.transfer_payload)} файл(и/ів)...")
+        self._set_status("Надсилаю файли...")
+        self._log(f"Надсилання {len(self.transfer_payload)} файл(и/ів)...")
+        threading.Thread(
+            target=self._send_worker, args=(self._transfer_root_dir(), list(self.transfer_payload)), daemon=True,
+        ).start()
+
+    def _send_worker(self, root_dir: str, files: list):
+        try:
+            send_files(self.channel_socket, self.channel_key, root_dir, files)
+            self._channel_queue.put({"kind": "send_done", "count": len(files)})
+        except TransportError as e:
+            self._channel_queue.put({"kind": "send_error", "error": str(e)})
 
     def _start_connection_setup(self):
         """Триетапна модель UPnP → STUN → LAN-only, автоматично й у фоновому потоці.
@@ -745,9 +960,12 @@ class SecureFileClientApp:
         path = filedialog.askdirectory(
             title="Оберіть каталог", initialdir=self.var_outgoing_dir.get() or None
         )
-        if not path:
-            return
+        if path:
+            self._select_send_dir(path)
 
+    def _select_send_dir(self, path: str):
+        """Спільна логіка для on_choose_dir і --snd-dir: те, що відбувається після
+        того, як каталог для передачі вже обрано (діалогом чи параметром CLI)."""
         self.selected_path = path
         self.selected_is_dir = True
         self.packed_archive_path = None
@@ -843,8 +1061,8 @@ class SecureFileClientApp:
             self.tree_files.set(iid, "chk", "☑" if checked else "☐")
 
     def on_initiate_transfer(self):
-        """Фіналізує self.transfer_payload (Фаза 3-транспорт ще не реалізований — лише
-        готуємо й звітуємо). Каталог: архів чи "як є" за var_archive_before_send."""
+        """Фіналізує self.transfer_payload — готує, що саме піде через send_files()
+        по кнопці «Надіслати». Каталог: архів чи "як є" за var_archive_before_send."""
         if not self.selected_path:
             messagebox.showwarning("Увага", "Спочатку оберіть файл або каталог.")
             return
@@ -853,11 +1071,9 @@ class SecureFileClientApp:
             self.transfer_payload = [self.selected_path]
             self.packed_archive_path = None
             self.var_transfer_status.set("Готово до передачі: 1 файл (як є).")
-            self._set_status(
-                f"Готово до передачі: {os.path.basename(self.selected_path)}. "
-                f"Передача (Фаза 3) ще не реалізована."
-            )
-            self._log(f"Ініціалізація передачі: 1 файл як є — {self.selected_path}. Фаза 3 ще не реалізована.")
+            self._set_status(f"Готово до передачі: {os.path.basename(self.selected_path)}.")
+            self._log(f"Ініціалізація передачі: 1 файл як є — {self.selected_path}.")
+            self._update_send_button_state()
             return
 
         # selected_path/selected_is_dir НЕ змінюємо (виправлений баг) — dev-notes.md.
@@ -883,14 +1099,14 @@ class SecureFileClientApp:
         if should_archive:
             password = None
             if encryption_level != EncryptionLevel.NONE:
-                if self.local_key is None:
+                password = self._session_key()
+                if password is None:
                     messagebox.showwarning(
                         "Увага",
-                        "Спочатку згенеруйте хендшейк — сесійний ключ використовується як "
-                        "пароль AES-шифрування архіву.",
+                        "Спочатку виконайте хендшейк (згенеруйте свій або обробіть вхідний) — "
+                        "сесійний ключ використовується як пароль AES-шифрування архіву.",
                     )
                     return
-                password = self.local_key
 
             try:
                 archive_path = build_archive_from_selection(
@@ -912,14 +1128,11 @@ class SecureFileClientApp:
                 f"Готово до передачі: 1 архів ({len(included_files)} файл(и/ів) усередині, "
                 f"{compress_kind}, {encryption_kind})."
             )
-            self._set_status(
-                f"Готово до передачі: архів з {len(included_files)} файл(и/ів). "
-                f"Передача (Фаза 3) ще не реалізована."
-            )
+            self._set_status(f"Готово до передачі: архів з {len(included_files)} файл(и/ів).")
             self._log(
                 f"Ініціалізація передачі: запаковано {len(included_files)} файл(и/ів) у {archive_path} "
                 f"({compress_kind}, {encryption_kind}; технічна підпапка {EXCHANGE.pack_subdir_name}, "
-                f"не входить у вибір). Фаза 3 ще не реалізована."
+                f"не входить у вибір)."
             )
         else:
             self.packed_archive_path = None
@@ -927,14 +1140,12 @@ class SecureFileClientApp:
             self.var_transfer_status.set(
                 f"Готово до передачі: {len(included_files)} файл(и/ів) як є (без архівування)."
             )
-            self._set_status(
-                f"Готово до передачі: {len(included_files)} файл(и/ів) як є. "
-                f"Передача (Фаза 3) ще не реалізована."
-            )
+            self._set_status(f"Готово до передачі: {len(included_files)} файл(и/ів) як є.")
             self._log(
-                f"Ініціалізація передачі: {len(included_files)} файл(и/ів) як є (без архівування). "
-                f"Фаза 3 ще не реалізована."
+                f"Ініціалізація передачі: {len(included_files)} файл(и/ів) як є (без архівування)."
             )
+
+        self._update_send_button_state()
 
     def on_choose_incoming_dir(self):
         path = filedialog.askdirectory(
