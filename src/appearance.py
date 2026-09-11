@@ -11,6 +11,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from connection import build_handshake_packet, derive_key, detect_local_address, key_fingerprint, parse_handshake_packet
@@ -21,6 +22,7 @@ from stun_client import StunError, get_public_address
 from tuning import APPEARANCE, CONNECTION, ENCRYPTION, EXCHANGE, STUN
 
 _TREE_LOADING_SUFFIX = "/__loading__"
+_ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 
 _HOST_SOURCE_LABELS = {
     "upnp": "публічна, через UPnP (порт прокинуто на роутері)",
@@ -43,6 +45,7 @@ class SecureFileClientApp:
         self.root.title(APPEARANCE.window_title)
         self.root.geometry(APPEARANCE.window_geometry)
         self.root.minsize(*APPEARANCE.window_min_size)
+        self._set_window_icon()
 
         self.local_key: bytes | None = None
         self.local_salt: bytes | None = None
@@ -79,6 +82,23 @@ class SecureFileClientApp:
 
         # Автоматично, без кнопки (docs/concept.md); в кінці __init__ — усе вже побудовано.
         self._start_connection_setup()
+
+    def _set_window_icon(self):
+        """assets/icon.ico (Windows) + assets/icon.png (крос-платформенно через stdlib
+        tkinter.PhotoImage, без Pillow). Відсутня іконка — не критично, просто пропускаємо."""
+        try:
+            ico_path = _ASSETS_DIR / "icon.ico"
+            if os.name == "nt" and ico_path.exists():
+                self.root.iconbitmap(default=str(ico_path))
+        except tk.TclError:
+            pass
+        try:
+            png_path = _ASSETS_DIR / "icon.png"
+            if png_path.exists():
+                self._icon_image = tk.PhotoImage(file=str(png_path))  # тримаємо референс — інакше GC забере
+                self.root.iconphoto(True, self._icon_image)
+        except tk.TclError:
+            pass
 
     # ---- тема ------------------------------------------------------------
 

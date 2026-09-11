@@ -59,7 +59,7 @@ class ProfileTuning:
 class AppearanceTuning:
     window_title: str = "Обмін файлами — підготовка сеансу"
     # Ширший дефолт під двоколонковий layout — старий 640x720 не вміщав дерево файлів.
-    window_geometry: str = "900x680"
+    window_geometry: str = "900x860"
     window_min_size: tuple[int, int] = (760, 520)
     text_widget_height: int = 6
     base_font_size_delta: int = 1  # наскільки збільшити системний дефолт (дрібний за замовчуванням)
