@@ -67,3 +67,7 @@ bin\run-tests.bat       # Windows
 ```
 
 `tests/test_transport.py` іноді флейкає під навантаженням (`KeyError`/`WinError 10053`) — відомий артефакт тестового сетапу (обидві сторони одночасно й слухають, і підключаються — у реальному застосунку так не буває), не production-баг. Деталі: `docs/testing.md`.
+
+
+
+claude --resume e3fc34b8-db26-4b3f-8252-9478a89ea199
