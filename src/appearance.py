@@ -5,9 +5,12 @@
 """
 
 import base64
+import ipaddress
 import os
 import queue
 import secrets
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -22,7 +25,7 @@ from nat_traversal import UpnpError, try_configure_port_forwarding
 from stun_client import StunError, get_public_address
 from transport import (
     ConnectionFailed, PeerClosed, TransportError, VerificationError,
-    establish_connection, receive_files, send_files, verify_channel,
+    establish_connection, receive_files, send_files, send_ping, verify_channel,
 )
 from tuning import APPEARANCE, CONNECTION, ENCRYPTION, EXCHANGE, STUN
 
@@ -34,6 +37,17 @@ _HOST_SOURCE_LABELS = {
     "stun": "публічна, через STUN (порт НЕ прокинуто, мапінг може бути тимчасовим)",
     None: "локальна, LAN-only",
 }
+
+
+def _is_private_host(host: str) -> bool:
+    """True — LAN/loopback-адреса (з'єднання пряме, без роутера). False — виглядає
+    публічною: якщо інша сторона за ТИМ САМИМ роутером (напр. тест на одному ПК),
+    з'єднання потребує підтримки NAT hairpin/loopback, яку не всі роутери мають —
+    dev-notes.md → "_maybe_start_channel_establishment — hairpin NAT попередження"."""
+    try:
+        return ipaddress.ip_address(host).is_private
+    except ValueError:
+        return False  # хостнейм (не голий IP) — вважаємо непрозорим, без спекуляцій
 
 # Людяні підписи для Combobox шифрування; ключ — те, що реально йде в build_archive_from_selection.
 _ENCRYPTION_LEVEL_LABELS = {
@@ -64,7 +78,10 @@ _HELP_TEXT = """Як користуватись
 
 
 class SecureFileClientApp:
-    def __init__(self, root: tk.Tk, initial_passphrase: str | None = None, initial_send_dir: str | None = None):
+    def __init__(
+        self, root: tk.Tk, initial_passphrase: str | None = None, initial_send_dir: str | None = None,
+        initial_port: int | None = None,
+    ):
         self.root = root
         self.root.title(APPEARANCE.window_title)
         self.root.geometry(APPEARANCE.window_geometry)
@@ -89,7 +106,15 @@ class SecureFileClientApp:
         self.channel_key: bytes | None = None  # сесійний ключ, яким верифіковано ЦЕЙ канал — dev-notes.md
         self.channel_verified: bool = False
         self._channel_thread_started: bool = False
+        # True поки триває саме встановлення (між стартом і connected/connection_failed/
+        # verification_failed) — керує тікером очікування (_tick_channel_wait, dev-notes.md).
+        self._channel_pending: bool = False
+        self._channel_wait_started_at: float = 0.0
         self._channel_queue: queue.Queue = queue.Queue()
+        # Зростає на кожен _invalidate_session_if_active — фонові потоки з попередньої
+        # спроби (їх не можна перервати на льоту) позначають свої події старим epoch,
+        # і _handle_channel_event їх ігнорує. dev-notes.md.
+        self._session_epoch: int = 0
 
         # rel_path (POSIX "/") -> чи включено; дефолт — усе включено (запис лише при зміні).
         self._file_tree_checked: dict[str, bool] = {}
@@ -107,6 +132,9 @@ class SecureFileClientApp:
         self.root.bind("<Escape>", lambda _e: self.root.destroy())
         self._log("Застосунок запущено.")
         self._log(f"Профіль завантажено: client_id={self.profile.client_id} ({config_path()}).")
+
+        if initial_port is not None:
+            self.var_port.set(str(initial_port))
 
         if initial_passphrase:
             self.var_passphrase.set(initial_passphrase)
@@ -240,20 +268,51 @@ class SecureFileClientApp:
             highlightthickness=0, borderwidth=0,
         )
 
+    # Windows/Tk: стандартні біндинги Ctrl+C/V/A прив'язані до keysym (символу), який
+    # ОС перекладає за поточною розкладкою клавіатури — під нелатинською розкладкою
+    # фізична клавіша "V" дає інший keysym (кириличну літеру), і Control-v мовчки не
+    # спрацьовує. event.keycode — фізична клавіша, від розкладки не залежить.
+    # Докладніше: docs/dev-notes.md → "_make_readonly_selectable / keycode".
+    _KEYCODE_A = 65
+    _KEYCODE_C = 67
+    _KEYCODE_V = 86
+    _KEYCODE_INSERT = 45
+
     def _make_readonly_selectable(self, text_widget) -> None:
         """Текст лишається виділюваним/копійованим (Ctrl+C, виділення мишею), але без
         редагування — на відміну від state="disabled", який у Tk блокує й виділення теж.
-        Докладніше: docs/dev-notes.md → "appearance.py: _make_readonly_selectable"."""
+        Ctrl+C/Ctrl+A виконуються ЯВНО (event_generate/tag_add), а не просто "пропускаються"
+        далі — інакше довелось би покладатись на штатний Tk-біндинг, який має ту саму
+        проблему з розкладкою, що й вирішуємо тут. Докладніше: docs/dev-notes.md →
+        "appearance.py: _make_readonly_selectable"."""
         navigation_keys = {"Left", "Right", "Up", "Down", "Prior", "Next", "Home", "End", "Tab"}
 
         def _block_edit(event):
             if event.keysym in navigation_keys:
                 return None
-            if event.state & 0x4 and event.keysym.lower() in ("c", "a", "insert"):
-                return None  # Ctrl+C / Ctrl+A / Ctrl+Insert — копіювання, дозволено
+            if event.state & 0x4:
+                if event.keycode in (self._KEYCODE_C, self._KEYCODE_INSERT):
+                    text_widget.event_generate("<<Copy>>")
+                    return "break"
+                if event.keycode == self._KEYCODE_A:
+                    text_widget.tag_add("sel", "1.0", "end")
+                    return "break"
             return "break"
 
         text_widget.bind("<Key>", _block_edit)
+
+    def _bind_layout_independent_paste(self, widget) -> None:
+        """Ctrl+V через keycode фізичної клавіші — той самий обхід нелатинської
+        розкладки клавіатури, що й _make_readonly_selectable. Не замінює штатний
+        Tk-біндинг (який далі теж працює під латинською розкладкою), а доповнює його —
+        "Вставити з буфера" лишається надійним фолбеком у будь-якому разі."""
+        def _on_key(event):
+            if event.state & 0x4 and event.keycode == self._KEYCODE_V:
+                widget.event_generate("<<Paste>>")
+                return "break"
+            return None
+
+        widget.bind("<Key>", _on_key)
 
     def _make_reserved_label(self, parent, text: str, wraplength: int, height: int, **pack_kwargs) -> ttk.Label:
         """Label у Frame фіксованої висоти — щоб ріст тексту (1->N рядків) не двигав вікно.
@@ -373,6 +432,13 @@ class SecureFileClientApp:
             row=1, column=3, sticky="w", padx=(0, 8), pady=(0, 8)
         )
 
+        # Зміна будь-якого з трьох параметрів хендшейку ПІСЛЯ того, як хендшейк уже
+        # згенеровано/оброблено, робить поточний ключ/канал недійсним — інша сторона
+        # деривувала ключ зі старим значенням. dev-notes.md → "_invalidate_session_if_active".
+        self.var_passphrase.trace_add("write", self._invalidate_session_if_active)
+        self.var_iterations.trace_add("write", self._invalidate_session_if_active)
+        self.var_port.trace_add("write", self._invalidate_session_if_active)
+
         # БЕЗ кнопки: перевірка запускається автоматично (_start_connection_setup), лише звіт тут.
         frame_conn = ttk.LabelFrame(parent, text="Мережеві налаштування")
         frame_conn.pack(fill="x", **pad)
@@ -421,12 +487,16 @@ class SecureFileClientApp:
         )
         self.text_in.pack(fill="x", padx=8, pady=8)
         self._style_text_widget(self.text_in)
+        self._bind_layout_independent_paste(self.text_in)
 
         btns_in = ttk.Frame(frame_in)
         btns_in.pack(fill="x", padx=8, pady=(0, 8))
         ttk.Button(
-            btns_in, text="Обробити вхідний хендшейк", command=self.on_process_incoming
+            btns_in, text="Вставити з буфера", command=self.on_paste_handshake
         ).pack(side="left")
+        ttk.Button(
+            btns_in, text="Обробити вхідний хендшейк", command=self.on_process_incoming
+        ).pack(side="left", padx=(8, 0))
 
         self.lbl_peer_fp = self._make_reserved_label(
             frame_in, "Код підтвердження ключа: —", wraplength=340, height=40, padx=8, pady=(0, 4)
@@ -442,6 +512,9 @@ class SecureFileClientApp:
             frame_channel, "", wraplength=340, height=40, padx=8, pady=8,
         )
         channel_label.configure(textvariable=self.var_channel_status)
+        ttk.Button(frame_channel, text="Перевірити канал", command=self.on_test_channel).pack(
+            anchor="w", padx=8, pady=(0, 8)
+        )
 
     def _build_session_right(self, parent: ttk.Frame):
         pad = {"padx": 10, "pady": 6}
@@ -567,6 +640,9 @@ class SecureFileClientApp:
         )
         ttk.Button(frame_dirs, text="Обрати...", command=self.on_choose_incoming_dir).grid(
             row=1, column=1, padx=(0, 8)
+        )
+        ttk.Button(frame_dirs, text="Відкрити", command=self.on_open_incoming_dir).grid(
+            row=1, column=2, padx=(0, 8)
         )
 
         ttk.Label(frame_dirs, text="Вихідні файли (звідки типово брати для передачі):").grid(
@@ -715,6 +791,20 @@ class SecureFileClientApp:
         self.root.clipboard_append(content)
         self._set_status("Хендшейк скопійовано в буфер обміну.")
 
+    def on_paste_handshake(self):
+        """Вставляє вміст буфера обміну напряму (root.clipboard_get()), в обхід
+        Ctrl+V/контекстного меню — Tk-віджети Text не мають штатного контекстного
+        меню "Вставити", а надійність самого Ctrl+V залежить від фокусу. Симетрично
+        до "Скопіювати в буфер" (on_copy_handshake). Докладніше: dev-notes.md."""
+        try:
+            content = self.root.clipboard_get()
+        except tk.TclError:
+            messagebox.showwarning("Увага", "Буфер обміну порожній або не містить тексту.")
+            return
+        self.text_in.delete("1.0", "end")
+        self.text_in.insert("1.0", content)
+        self._set_status("Вставлено з буфера обміну.")
+
     def on_process_incoming(self):
         passphrase = self.var_passphrase.get()
         if not passphrase:
@@ -760,6 +850,52 @@ class SecureFileClientApp:
         хендшейку — явна дія "приєднатись до сеансу іншої сторони"."""
         return self.peer_key if self.peer_key is not None else self.local_key
 
+    def _invalidate_session_if_active(self, *_trace_args):
+        """trace на var_passphrase/var_iterations/var_port — будь-яка зміна одного з них
+        ПІСЛЯ того, як хендшейк уже згенеровано/оброблено, робить поточний ключ/канал
+        недійсним (інша сторона деривувала ключ зі старим значенням, чи слухає застарілий
+        порт — саме так знайдено реальний баг). Скидає стан і повідомляє про потребу
+        повторного обміну хендшейком, замість мовчки лишати застарілий канал.
+        Докладніше: docs/dev-notes.md → "_invalidate_session_if_active"."""
+        session_active = (
+            self.local_key is not None or self.peer_key is not None
+            or self.channel_socket is not None or self._channel_thread_started
+        )
+        if not session_active:
+            return  # нічого ще не було згенеровано/оброблено — звичайне введення пароля
+
+        self._session_epoch += 1  # застарілі фонові потоки з попередньої спроби більше не мають ефекту
+
+        if self.channel_socket is not None:
+            try:
+                self.channel_socket.close()
+            except OSError:
+                pass
+
+        self.local_key = None
+        self.local_salt = None
+        self.local_session_id = None
+        self.peer_key = None
+        self.peer_host = None
+        self.peer_port = None
+        self.local_port = None
+        self.channel_socket = None
+        self.channel_key = None
+        self.channel_verified = False
+        self._channel_thread_started = False
+        self._channel_pending = False
+
+        self.text_out.delete("1.0", "end")
+        self.lbl_local_fp.configure(text="Код підтвердження: —")
+        self.lbl_peer_fp.configure(text="Код підтвердження ключа: —")
+        self.var_channel_status.set("Параметри змінено — попередній хендшейк і канал недійсні.")
+        self._update_send_button_state()
+        self._set_status(
+            "Параметри хендшейку змінено — згенеруйте/обробіть хендшейк заново й "
+            "надішліть його іншій стороні повторно."
+        )
+        self._log("Параметри хендшейку змінено — попередній сеанс і канал скинуто.")
+
     def _maybe_start_channel_establishment(self):
         """Стартує встановлення каналу, щойно відомий сесійний ключ. peer_host/
         peer_port — опційні: за протоколом docs/concept.md хендшейк ділиться лише
@@ -778,39 +914,67 @@ class SecureFileClientApp:
         self.local_port = local_port
 
         self._channel_thread_started = True
+        self._channel_pending = True
+        self._channel_wait_started_at = time.monotonic()
         if self.peer_host is not None and self.peer_port is not None:
-            self.var_channel_status.set("Встановлюю з'єднання...")
+            self.var_channel_status.set(f"Встановлюю з'єднання з {self.peer_host}:{self.peer_port}...")
             self._log(
                 f"Канал передачі: встановлюю з'єднання з {self.peer_host}:{self.peer_port} "
                 f"(локальний порт {self.local_port})..."
             )
+            if not _is_private_host(self.peer_host):
+                self._log(
+                    f"Канал передачі: адреса іншої сторони ({self.peer_host}) публічна — якщо "
+                    f"обидві сторони за одним роутером (напр. тест на одному ПК), з'єднання може "
+                    f"не пройти без підтримки NAT hairpin/loopback на роутері."
+                )
         else:
             self.var_channel_status.set(f"Слухаю на порту {self.local_port} — чекаю на іншу сторону...")
             self._log(f"Канал передачі: слухаю на порту {self.local_port}, чекаю підключення.")
-        threading.Thread(target=self._channel_establish_worker, args=(session_key,), daemon=True).start()
+        epoch = self._session_epoch
+        threading.Thread(target=self._channel_establish_worker, args=(session_key, epoch), daemon=True).start()
+        self.root.after(1000, self._tick_channel_wait, epoch)
 
-    def _channel_establish_worker(self, session_key: bytes):
+    def _tick_channel_wait(self, epoch: int):
+        """Раз/с дописує до статусу скільки часу вже триває встановлення каналу —
+        інакше 300с очікування виглядають як зависання, не активна спроба (dev-notes.md)."""
+        if epoch != self._session_epoch or not self._channel_pending:
+            return
+        elapsed = int(time.monotonic() - self._channel_wait_started_at)
+        base = self.var_channel_status.get().split(" (")[0]
+        self.var_channel_status.set(f"{base} ({elapsed}с)")
+        self.root.after(1000, self._tick_channel_wait, epoch)
+
+    def _put_channel_event(self, epoch: int, event: dict) -> None:
+        """Тегує подію її epoch — _handle_channel_event ігнорує застарілі (dev-notes.md)."""
+        event["epoch"] = epoch
+        self._channel_queue.put(event)
+
+    def _channel_establish_worker(self, session_key: bytes, epoch: int):
         """Фоновий потік — жодних звернень до self.root/tkinter, лише мережа й запис у чергу.
-        Широкі except Exception — щоб неочікувана помилка не вбила потік мовчки (dev-notes.md)."""
+        Широкі except Exception — щоб неочікувана помилка не вбила потік мовчки (dev-notes.md).
+        epoch — знімок self._session_epoch на момент старту; якщо параметри хендшейку
+        зміняться, поки цей потік ще працює (перервати сокет-виклики на льоту не можна),
+        _handle_channel_event ігнорує його події як застарілі."""
         try:
             sock = establish_connection(self.local_port, self.peer_host, self.peer_port)
         except ConnectionFailed as e:
-            self._channel_queue.put({"kind": "connection_failed", "error": str(e)})
+            self._put_channel_event(epoch, {"kind": "connection_failed", "error": str(e)})
             return
         except Exception as e:
-            self._channel_queue.put({"kind": "connection_failed", "error": f"{type(e).__name__}: {e}"})
+            self._put_channel_event(epoch, {"kind": "connection_failed", "error": f"{type(e).__name__}: {e}"})
             return
         try:
             verify_channel(sock, session_key)
         except VerificationError as e:
             sock.close()
-            self._channel_queue.put({"kind": "verification_failed", "error": str(e)})
+            self._put_channel_event(epoch, {"kind": "verification_failed", "error": str(e)})
             return
         except Exception as e:
             sock.close()
-            self._channel_queue.put({"kind": "verification_failed", "error": f"{type(e).__name__}: {e}"})
+            self._put_channel_event(epoch, {"kind": "verification_failed", "error": f"{type(e).__name__}: {e}"})
             return
-        self._channel_queue.put({"kind": "connected", "socket": sock, "key": session_key})
+        self._put_channel_event(epoch, {"kind": "connected", "socket": sock, "key": session_key})
 
     def _poll_channel_events(self):
         """Персистентний опитувач self._channel_queue — стартує в __init__ і
@@ -824,13 +988,23 @@ class SecureFileClientApp:
         self.root.after(200, self._poll_channel_events)
 
     def _handle_channel_event(self, event: dict):
+        if event.get("epoch") != self._session_epoch:
+            return  # застаріла подія з потоку попереднього сеансу (dev-notes.md) — ігноруємо
         kind = event["kind"]
 
         if kind == "connection_failed":
-            self.var_channel_status.set("Не вдалось встановити з'єднання.")
-            self._log(f"Канал передачі: {event['error']}")
+            self._channel_pending = False
+            hint = ""
+            if self.peer_host is not None and not _is_private_host(self.peer_host):
+                hint = (
+                    f" Адреса {self.peer_host} публічна — ймовірна причина: NAT hairpin/loopback "
+                    f"не підтримується роутером (типово при тестуванні двох сторін за одним роутером)."
+                )
+            self.var_channel_status.set(f"Не вдалось встановити з'єднання.{hint}")
+            self._log(f"Канал передачі: {event['error']}{hint}")
 
         elif kind == "verification_failed":
+            self._channel_pending = False
             self.var_channel_status.set("Ключі НЕ збігаються — звірте код підтвердження вручну.")
             self._log(f"Канал передачі: {event['error']}")
             messagebox.showwarning(
@@ -841,13 +1015,14 @@ class SecureFileClientApp:
             )
 
         elif kind == "connected":
+            self._channel_pending = False
             self.channel_socket = event["socket"]
             self.channel_key = event["key"]
             self.channel_verified = True
             self.var_channel_status.set("Підтверджено — канал готовий до передачі.")
             self._log("Канал передачі: ключі підтверджено, з'єднання готове.")
             self._update_send_button_state()
-            threading.Thread(target=self._receive_worker, daemon=True).start()
+            threading.Thread(target=self._receive_worker, args=(event["epoch"],), daemon=True).start()
 
         elif kind == "receive_progress":
             self.progress_bar["value"] = event["pct"]
@@ -896,7 +1071,15 @@ class SecureFileClientApp:
             self.var_progress_text.set("")
             self.btn_send.configure(state="normal")
 
-    def _receive_worker(self):
+        elif kind == "channel_test_ok":
+            self._set_status("Перевірка каналу: отримано відповідь — канал працює.")
+            self._log("Перевірка каналу: pong отримано, канал живий.")
+
+        elif kind == "channel_test_failed":
+            self._set_status(f"Перевірка каналу: не вдалось надіслати ping — {event['error']}")
+            self._log(f"Перевірка каналу: помилка — {event['error']}")
+
+    def _receive_worker(self, epoch: int):
         """Фоновий потік: приймає файли в profile.incoming_dir, доки інша сторона
         не закриє з'єднання. Цикл — щоб приймати кілька послідовних передач за сеанс."""
         # Без агрегованого прогресу (на відміну від send) — receive_files не знає
@@ -907,29 +1090,52 @@ class SecureFileClientApp:
             pct = int(done * 100 / total) if total else 100
             if pct != last_pct["value"]:
                 last_pct["value"] = pct
-                self._channel_queue.put({"kind": "receive_progress", "name": rel_path, "pct": pct})
+                self._put_channel_event(epoch, {"kind": "receive_progress", "name": rel_path, "pct": pct})
+
+        def on_control(_header: dict):
+            # Наразі єдиний тип — {"type":"pong"}, відповідь на наш send_ping (on_test_channel).
+            self._put_channel_event(epoch, {"kind": "channel_test_ok"})
 
         while True:
             try:
                 received = receive_files(
-                    self.channel_socket, self.channel_key, self.profile.incoming_dir, on_progress=on_progress
+                    self.channel_socket, self.channel_key, self.profile.incoming_dir,
+                    on_progress=on_progress, on_control=on_control,
                 )
-                self._channel_queue.put({"kind": "receive_done", "files": received})
+                self._put_channel_event(epoch, {"kind": "receive_done", "files": received})
             except PeerClosed:
-                self._channel_queue.put({"kind": "receive_closed"})
+                self._put_channel_event(epoch, {"kind": "receive_closed"})
                 return
             except TransportError as e:
-                self._channel_queue.put({"kind": "receive_error", "error": str(e)})
+                self._put_channel_event(epoch, {"kind": "receive_error", "error": str(e)})
                 return
             except Exception as e:
                 # Побитий/ворожий кадр чи зникнення диска — теж має зупинити цикл із
                 # видимою помилкою, а не тихо вбити потік (dev-notes.md).
-                self._channel_queue.put({"kind": "receive_error", "error": f"{type(e).__name__}: {e}"})
+                self._put_channel_event(epoch, {"kind": "receive_error", "error": f"{type(e).__name__}: {e}"})
                 return
 
     def _update_send_button_state(self):
         ready = self.channel_verified and bool(self.transfer_payload)
         self.btn_send.configure(state="normal" if ready else "disabled")
+
+    def on_test_channel(self):
+        """Перевіряє, що канал реально живий (ping/pong), без вибору/пакування файлів —
+        відповідь приходить через той самий _receive_worker, що вже читає сокет (dev-notes.md)."""
+        if not self.channel_verified or self.channel_socket is None:
+            messagebox.showwarning("Увага", "Канал ще не готовий — зачекайте на підтвердження з'єднання.")
+            return
+        self._set_status("Перевірка каналу: надсилаю ping...")
+        self._log("Перевірка каналу: надсилаю ping.")
+        threading.Thread(
+            target=self._test_channel_worker, args=(self._session_epoch,), daemon=True
+        ).start()
+
+    def _test_channel_worker(self, epoch: int):
+        try:
+            send_ping(self.channel_socket)
+        except OSError as e:
+            self._put_channel_event(epoch, {"kind": "channel_test_failed", "error": str(e)})
 
     def _transfer_root_dir(self) -> str:
         if self.packed_archive_path:
@@ -953,10 +1159,12 @@ class SecureFileClientApp:
         self._set_status("Надсилаю файли...")
         self._log(f"Надсилання {len(self.transfer_payload)} файл(и/ів)...")
         threading.Thread(
-            target=self._send_worker, args=(self._transfer_root_dir(), list(self.transfer_payload)), daemon=True,
+            target=self._send_worker,
+            args=(self._transfer_root_dir(), list(self.transfer_payload), self._session_epoch),
+            daemon=True,
         ).start()
 
-    def _send_worker(self, root_dir: str, files: list):
+    def _send_worker(self, root_dir: str, files: list, epoch: int):
         # Агрегований прогрес по всіх файлах разом (розмір відомий заздалегідь — на
         # відміну від прийому, де файли йдуть потоком без наперед відомого підсумку).
         progress = {"prev_name": None, "bytes_before_current": 0, "prev_total": 0, "last_pct": -1}
@@ -969,18 +1177,18 @@ class SecureFileClientApp:
             pct = int((progress["bytes_before_current"] + done) * 100 / total_bytes)
             if pct != progress["last_pct"]:
                 progress["last_pct"] = pct
-                self._channel_queue.put({"kind": "send_progress", "name": rel_path, "pct": pct})
+                self._put_channel_event(epoch, {"kind": "send_progress", "name": rel_path, "pct": pct})
 
         try:
             total_bytes = sum(os.path.getsize(f) for f in files) or 1
             send_files(self.channel_socket, self.channel_key, root_dir, files, on_progress=on_progress)
-            self._channel_queue.put({"kind": "send_done", "count": len(files)})
+            self._put_channel_event(epoch, {"kind": "send_done", "count": len(files)})
         except TransportError as e:
-            self._channel_queue.put({"kind": "send_error", "error": str(e)})
+            self._put_channel_event(epoch, {"kind": "send_error", "error": str(e)})
         except Exception as e:
             # Напр. файл зник/заблокований між "Ініціалізувати" й "Надіслати" —
             # має розблокувати кнопку з видимою помилкою, а не тихо вбити потік.
-            self._channel_queue.put({"kind": "send_error", "error": f"{type(e).__name__}: {e}"})
+            self._put_channel_event(epoch, {"kind": "send_error", "error": f"{type(e).__name__}: {e}"})
 
     def _start_connection_setup(self):
         """Триетапна модель UPnP → STUN → LAN-only, автоматично й у фоновому потоці.
@@ -1286,6 +1494,23 @@ class SecureFileClientApp:
         )
         if path:
             self.var_incoming_dir.set(path)
+
+    def on_open_incoming_dir(self):
+        """Відкриває поточний (уже збережений у профілі) каталог вхідних файлів
+        у файловому менеджері ОС — перегляд прийнятого без пошуку вручну."""
+        path = self.profile.incoming_dir
+        if not os.path.isdir(path):
+            messagebox.showinfo("Каталог порожній", f"Каталог ще не створено (нічого не отримано): {path}")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except OSError as e:
+            messagebox.showerror("Помилка", f"Не вдалось відкрити каталог: {e}")
 
     def on_choose_outgoing_dir(self):
         path = filedialog.askdirectory(

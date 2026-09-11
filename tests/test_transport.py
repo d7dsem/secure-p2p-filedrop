@@ -23,6 +23,7 @@ from transport import (
     establish_connection,
     receive_files,
     send_files,
+    send_ping,
     verify_channel,
 )
 
@@ -278,6 +279,44 @@ class SendReceiveFilesTests(unittest.TestCase):
         self.assertIsNotNone(outcomes.get("error"))
         escaped_path = os.path.join(os.path.dirname(self.recv_root), "escape.txt")
         self.assertFalse(os.path.exists(escaped_path))
+
+    def test_ping_gets_pong_via_on_control_callback(self):
+        """on_test_channel (appearance.py) — перевірка каналу без файлів: send_ping
+        з боку A; receive_files з боку B автоматично відповідає pong і продовжує
+        цикл (не плутає з файловим кадром, не завершує прийом); receive_files з боку
+        A (той самий цикл, що й _receive_worker в appearance.py) бачить pong через
+        on_control."""
+        sock_a, sock_b = self._connected_verified_pair()
+        outcomes = {}
+        recv_root_b = tempfile.mkdtemp(prefix="test_transport_ping_b_")
+        self.addCleanup(shutil.rmtree, recv_root_b, ignore_errors=True)
+
+        def side_a():
+            send_ping(sock_a)
+
+            def on_control(header):
+                outcomes["control"] = header
+
+            try:
+                receive_files(sock_a, _KEY_A, self.recv_root, on_control=on_control)
+            except (TransportError, OSError):
+                pass  # очікувано: закриємо сокети наприкінці тесту (Windows: ConnectionResetError)
+
+        def side_b():
+            try:
+                receive_files(sock_b, _KEY_A, recv_root_b)
+            except (TransportError, OSError):
+                pass
+
+        ta = threading.Thread(target=side_a, daemon=True)
+        tb = threading.Thread(target=side_b, daemon=True)
+        ta.start(); tb.start()
+        ta.join(timeout=3)  # достатньо для ping/pong round-trip на loopback
+
+        sock_a.close(); sock_b.close()
+        ta.join(timeout=5); tb.join(timeout=5)
+
+        self.assertEqual(outcomes.get("control"), {"type": "pong"})
 
 
 if __name__ == "__main__":

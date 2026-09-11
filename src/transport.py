@@ -253,10 +253,22 @@ def send_files(sock: socket.socket, key: bytes, root_dir: str, file_paths: list,
     send_json(sock, {"type": "done"})
 
 
-def receive_files(sock: socket.socket, key: bytes, dest_dir: str, on_progress=None) -> list:
+def send_ping(sock: socket.socket) -> None:
+    """Перевірка каналу без передачі файлів — просто кадр, на який приймаюча сторона
+    (receive_files) одразу відповідає {"type":"pong"} і продовжує далі. Не потребує
+    ключа: сам факт відповіді підтверджує лише живий TCP-канал, не крипто-стан."""
+    send_json(sock, {"type": "ping"})
+
+
+def receive_files(sock: socket.socket, key: bytes, dest_dir: str, on_progress=None, on_control=None) -> list:
     """Приймає файли, доки не прийде {"type":"done"} або з'єднання не закриється.
     Повертає список абсолютних шляхів записаних файлів. Перевіряє SHA-256 кожного —
-    невідповідність -> TransportError, файл не лишається напівзаписаним без попередження."""
+    невідповідність -> TransportError, файл не лишається напівзаписаним без попередження.
+
+    on_control(dict), якщо задано, викликається для НЕ-файлових контрольних кадрів
+    (наразі лише {"type":"pong"}) — так виклик send_ping з іншого боку можна прозоро
+    "перевірити канал" через той самий єдиний потік, що вже читає цей сокет (appearance.py:
+    _receive_worker), не змагаючись за сокет другим паралельним читачем."""
     received: list = []
     os.makedirs(dest_dir, exist_ok=True)
 
@@ -264,6 +276,13 @@ def receive_files(sock: socket.socket, key: bytes, dest_dir: str, on_progress=No
         header = recv_json(sock)
         if header.get("type") == "done":
             break
+        if header.get("type") == "ping":
+            send_json(sock, {"type": "pong"})
+            continue
+        if header.get("type") == "pong":
+            if on_control:
+                on_control(header)
+            continue
         if header.get("type") != "file":
             raise TransportError(f"Неочікуваний тип кадру: {header.get('type')!r}")
 

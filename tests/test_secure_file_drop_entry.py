@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Тести CLI-аргументів (--pswd/-p, --snd-dir) — Рівень 1 з docs/testing.md, чисте argparse без GUI.
+Тести CLI-аргументів (--pswd/-p, --snd-dir, --port) — Рівень 1 з docs/testing.md, чисте argparse без GUI.
 """
 
 import unittest
@@ -36,6 +36,15 @@ class ParseArgsTests(unittest.TestCase):
         args = parse_args(["--pswd", "hunter2", "--snd-dir", "/tmp/payload"])
         self.assertEqual(args.passphrase, "hunter2")
         self.assertEqual(args.send_dir, "/tmp/payload")
+
+    def test_no_args_port_is_none(self):
+        args = parse_args([])
+        self.assertIsNone(args.port)
+
+    def test_port_flag_sets_int_port(self):
+        args = parse_args(["--port", "52074"])
+        self.assertEqual(args.port, 52074)
+        self.assertIsInstance(args.port, int)
 
 
 if __name__ == "__main__":
