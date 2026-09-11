@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Шар "підключення": мінімальний STUN-клієнт (RFC 5389) — рівень 2 моделі
-встановлення з'єднання з docs/concept.md.
-
-ПРИНЦИПОВО: це разовий stateless UDP Binding Request до вже готового
-публічного STUN-сервера — щоб дізнатись, якою публічною IP:port бачить
-нас NAT. Жодних файлових даних, жодного сесійного ключа туди не йде, і
-застосунок нічого не хостить сам — сервер лише "відлунює" адресу назад,
-як дзеркало. Це відрізняється від nat_traversal.py (UPnP): там ми
-говоримо з ВЛАСНИМ роутером і просимо його прокинути порт; тут ми лише
-дізнаємось адресу, порт лишається непрокинутим (NAT-мапінг тримається
-доти, доки триває сам UDP-обмін, без гарантії тривалості).
+Шар "підключення": мінімальний STUN-клієнт (RFC 5389) — рівень 2 моделі з'єднання.
+Чим відрізняється від UPnP (nat_traversal.py): docs/dev-notes.md → "stun_client.py".
 """
 
 import os
@@ -112,13 +103,8 @@ def get_public_address(
     server_port: int | None = None,
     timeout: float | None = None,
 ) -> tuple[str, int]:
-    """
-    Прив'язується до local_port і питає публічний STUN-сервер, яку
-    публічну IP:port бачить для цього сокета NAT. Кидає StunError при
-    будь-якій невдачі (таймаут, немає відповіді, немає мережі) — виклик
-    з appearance.py має це ловити й переходити до наступного/останнього
-    рівня моделі встановлення з'єднання (docs/concept.md).
-    """
+    """Прив'язується до local_port, питає STUN-сервер публічну IP:port для цього сокета.
+    Кидає StunError при невдачі — виклик з appearance.py переходить до наступного рівня."""
     host = server_host or STUN.server_host
     port = server_port or STUN.server_port
     timeout = STUN.timeout_seconds if timeout is None else timeout

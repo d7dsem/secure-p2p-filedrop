@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Шар "підключення": UPnP IGD-клієнт для проходження NAT.
-
-ПРИНЦИПОВО (зафіксовано за вимогою користувача — жодних третіх сторін
-в архітектурі): цей модуль говорить ЛИШЕ з роутером у власній локальній
-мережі користувача — SSDP-пошук (UDP-multicast у межах LAN) і SOAP-запити
-на control URL, отриманий із XML-опису самого роутера. Жодного зовнішнього
-сервера (ні STUN, ні relay, ні "what's my ip"-подібних сервісів) тут немає
-і бути не повинно.
-
-Якщо роутер не підтримує UPnP (вимкнено, немає підтримки, CGNAT у
-провайдера тощо) — це фіксується як UpnpUnavailable/UpnpActionError, і
-виклик з appearance.py має впасти назад на ручний ввід публічної IP та
-ручний проброс порту користувачем (докладніше — docs/concept.md).
+Шар "підключення": UPnP IGD-клієнт для проходження NAT — говорить лише з роутером у LAN.
+Докладніше про межі відповідальності й фолбек при невдачі: docs/dev-notes.md → "nat_traversal.py".
 """
 
 import socket
@@ -78,9 +67,7 @@ def _parse_header(raw_response: str, header_name: str) -> str | None:
 # --------------------------------------------------------------------------
 
 def _ssdp_discover(search_target: str, timeout: float) -> list[str]:
-    """Надсилає SSDP M-SEARCH у локальний мультикаст-сегмент і збирає
-    заголовки LOCATION з відповідей. Працює тільки в межах LAN — це не
-    звернення до жодного зовнішнього хоста."""
+    """SSDP M-SEARCH у локальний мультикаст-сегмент; збирає заголовки LOCATION з відповідей."""
     message = "\r\n".join([
         "M-SEARCH * HTTP/1.1",
         f"HOST: {NAT.ssdp_address}:{NAT.ssdp_port}",
@@ -131,9 +118,8 @@ def _find_wan_service(root: ET.Element, base_url: str) -> tuple[str, str] | None
 
 
 def discover_igd_control_url(timeout: float | None = None) -> tuple[str, str]:
-    """Знаходить у локальній мережі UPnP IGD-роутер і повертає
-    (control_url, service_type) для подальших SOAP-запитів.
-    Кидає UpnpUnavailable, якщо жодного придатного роутера не знайдено."""
+    """Шукає UPnP IGD-роутер у LAN, повертає (control_url, service_type) для SOAP-запитів,
+    або кидає UpnpUnavailable."""
     timeout = NAT.discovery_timeout_seconds if timeout is None else timeout
     locations = _ssdp_discover(NAT.ssdp_search_target, timeout)
 
@@ -250,16 +236,8 @@ def add_port_mapping(
 # --------------------------------------------------------------------------
 
 def try_configure_port_forwarding(local_ip: str, local_port: int, protocol: str = "TCP") -> str:
-    """
-    Одна функція для GUI: (1) знаходить UPnP IGD у своїй LAN, (2) дізнається
-    зовнішню IP, (3) просить прокинути зовнішній порт на local_ip:local_port.
-    Повертає зовнішню IP при успіху.
-
-    Кидає UpnpError (UpnpUnavailable/UpnpActionError) при будь-якій
-    невдачі — виклик з appearance.py має це ловити й пропонувати
-    користувачу ручний fallback (самостійний проброс порту + ручний ввід
-    публічної IP), а не намагатись достукатись кудись іще.
-    """
+    """Знаходить UPnP IGD, дізнається зовнішню IP і прокидає local_port. Повертає зовнішню
+    IP; кидає UpnpError — виклик з appearance.py ловить і пропонує ручний fallback."""
     control_url, service_type = discover_igd_control_url()
     external_ip = get_external_ip(control_url, service_type)
     add_port_mapping(

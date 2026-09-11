@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Модульні тести шару "профіль" (`local_config.py`) — Рівень 1 з
-docs/testing.md. Без GUI, без мережі, без участі користувача.
-
-Усюди передається явний `path` (замість реального ~/config.json), тому
-тести не чіпають справжній домашній каталог користувача, що б не
-сталось.
+Модульні тести шару "профіль" (local_config.py) — Рівень 1 з docs/testing.md.
+Явний `path` замість ~/config.json — див. docs/dev-notes.md → "tests/test_local_config.py".
 """
 
 import json

@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Єдине місце зберігання конфігураційних параметрів і значень, щоб уникнути
-магічних констант у решті коду.
-
-Кожен датаклас відповідає окремому шару застосунку — назва датакласу
-вказує, до якого компонента системи належать його параметри:
-  - ConnectionTuning — деривація ключа й хендшейк (шар "підключення");
-  - NatTuning — UPnP-проброс порту, теж шар "підключення";
-  - StunTuning — публічний STUN-сервер (рівень 2 моделі встановлення
-    з'єднання, теж шар "підключення" — див. docs/concept.md);
-  - ProfileTuning — де шукати персистентний локальний конфіг користувача
-    (client_id, дефолтні каталоги) — шар "профіль";
-  - AppearanceTuning — вікно, тема, розміри (шар "зовнішність");
-  - ExchangeTuning — підготовка даних до передачі (шар "обмін").
+Єдине місце зберігання конфігураційних параметрів, щоб уникнути магічних констант у решті коду.
+Кожен датаклас = один шар застосунку (назва вказує на шар); мапа шарів — docs/dev-notes.md → "tuning.py".
 """
 
 from dataclasses import dataclass
@@ -35,9 +24,7 @@ class ConnectionTuning:
 
 @dataclass(frozen=True)
 class NatTuning:
-    """UPnP IGD: спілкування лише з власним роутером користувача (SSDP у
-    локальному сегменті мережі + SOAP на control URL, знайдений через
-    SSDP) — жодного зовнішнього/третього сервера. Див. docs/concept.md."""
+    """UPnP IGD: лише власний роутер користувача, жодного зовнішнього сервера. Див. docs/concept.md."""
     ssdp_address: str = "239.255.255.250"
     ssdp_port: int = 1900
     ssdp_search_target: str = "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
@@ -49,11 +36,8 @@ class NatTuning:
 
 @dataclass(frozen=True)
 class StunTuning:
-    """Публічний STUN-сервер — рівень 2 моделі встановлення з'єднання
-    (docs/concept.md, "Принципове архітектурне обмеження"): НЕ власна
-    інфраструктура, а разовий stateless-запит до вже готового чужого
-    сервісу лише для того, щоб дізнатись свою публічну IP:port — жодних
-    файлових даних чи сесійного ключа туди не йде."""
+    """Публічний STUN-сервер, рівень 2 моделі з'єднання — не власна інфраструктура,
+    разовий stateless-запит. Див. docs/concept.md, "Принципове архітектурне обмеження"."""
     server_host: str = "stun.l.google.com"
     server_port: int = 19302
     timeout_seconds: float = 2.0
@@ -61,13 +45,8 @@ class StunTuning:
 
 @dataclass(frozen=True)
 class ProfileTuning:
-    """Шар "профіль": ЦІ значення лише задають, ДЕ шукати персистентний
-    локальний конфіг користувача (client_id, дефолтні каталоги
-    вхідних/вихідних файлів) і які дефолти підставити при першому
-    запуску. Самі поточні користувацькі значення живуть у
-    local_config.py / файлі конфігу на диску, не тут — на відміну від
-    решти tuning.py, це не незмінні дефолти застосунку, а лише "звідки
-    старт", далі користувач їх редагує й зберігає сам."""
+    """Шар "профіль": лише ДЕ шукати конфіг і дефолти для першого запуску —
+    поточні значення живуть у local_config.py. Докладніше: docs/dev-notes.md."""
     config_dir_name: str = ".secure_p2p_filedrop"
     config_file_name: str = "config.json"
     default_incoming_subdir: str = "SecureFileDrop/incoming"
@@ -79,14 +58,14 @@ class ProfileTuning:
 @dataclass(frozen=True)
 class AppearanceTuning:
     window_title: str = "Обмін файлами — підготовка сеансу"
-    window_geometry: str = "640x720"
-    window_min_size: tuple[int, int] = (560, 640)
+    # Ширший дефолт під двоколонковий layout — старий 640x720 не вміщав дерево файлів.
+    window_geometry: str = "900x680"
+    window_min_size: tuple[int, int] = (760, 520)
     text_widget_height: int = 6
+    base_font_size_delta: int = 1  # наскільки збільшити системний дефолт (дрібний за замовчуванням)
+    heading_font_size_delta: int = 1  # наскільки заголовки секцій більші за (вже збільшений) базовий шрифт
 
-    # Палітра темної теми. Ttk не має вбудованої темної теми "з коробки" —
-    # кольори задаються вручну через ttk.Style (для ttk-віджетів) і напряму
-    # через configure() для класичних Tk-віджетів (Text/ScrolledText не є
-    # ttk-віджетами й стилем не керуються).
+    # Палітра темної теми (ttk не має її "з коробки"). Докладніше: docs/dev-notes.md.
     dark_bg: str = "#1e1e1e"
     dark_bg_panel: str = "#252526"
     dark_fg: str = "#e6e6e6"
@@ -95,15 +74,18 @@ class AppearanceTuning:
     dark_accent: str = "#3a7afe"
     dark_border: str = "#3c3c3c"
 
+    # Темніший за dark_accent фон CTA-кнопок — контраст з текстом ~6.3:1 проти ~3.1:1
+    # (нижче WCAG AA). Докладніше: docs/dev-notes.md → "tuning.py: AppearanceTuning.accent_button_bg".
+    accent_button_bg: str = "#2f5fac"
+    accent_button_fg: str = "#ffffff"
+
 
 @dataclass(frozen=True)
 class ExchangeTuning:
     archive_file_name: str = "payload.zip"
     temp_dir_prefix: str = "secure_transfer_"
-    # Технічна підпапка в корені обраного каталогу передачі, куди
-    # складається архів вибраних елементів (appearance.py, вкладка
-    # "Сеанс" -> дерево з чекбоксами). Виключається зі сканування/показу
-    # дерева, щоб сама не потрапила у вибір і не запакувала сама себе.
+    # Технічна підпапка під архів у корені обраного каталогу — виключається зі сканування
+    # (appearance.py), щоб сама не потрапила у вибір. Докладніше: docs/dev-notes.md.
     pack_subdir_name: str = ".secure_p2p_filedrop_pack"
     size_units: tuple[str, ...] = ("Б", "КБ", "МБ", "ГБ", "ТБ")
 

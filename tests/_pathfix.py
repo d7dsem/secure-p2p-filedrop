@@ -1,9 +1,6 @@
 """
-`src/` не є Python-пакетом (модулі імпортують один одного напряму, напр.
-`from tuning import CONNECTION`, без префіксу `src.`), тому тестові модулі
-роблять `import _pathfix` першим рядком, щоб додати `src/` у sys.path до
-того, як щось із нього імпортувати. Працює незалежно від того, як саме
-запущено тести (`unittest discover` з/без `-t`, прямий запуск файлу тощо).
+Додає src/ у sys.path (src/ не є пакетом) — кожен тест робить `import _pathfix` першим рядком.
+Докладніше: docs/dev-notes.md → "tests/_pathfix.py + tests/__init__.py".
 """
 
 import os

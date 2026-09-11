@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Модульні тести шару "підключення" (`connection.py`) — Рівень 1 з
-docs/testing.md. Без GUI, без мережі, без участі користувача.
-
-Запуск: python -m unittest discover -s tests -v
+Модульні тести шару "підключення" (connection.py) — Рівень 1 з docs/testing.md, без GUI/мережі.
 """
 
 import base64

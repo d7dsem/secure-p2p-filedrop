@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Тести чистої логіки stun_client.py — Рівень 1 з docs/testing.md.
-
-Реальний UDP-обмін зі справжнім публічним STUN-сервером тут НЕ
-тестується (мережева залежність, зовнішній сервіс) — лише кодування
-Binding Request і розбір (синтетичного) Binding Response, включно з
-XOR-MAPPED-ADDRESS/MAPPED-ADDRESS і помилковими відповідями.
+Тести чистої логіки stun_client.py — Рівень 1 з docs/testing.md (без живого STUN-сервера).
+Що саме НЕ тестується і чому: docs/dev-notes.md → "tests/test_stun_client.py".
 """
 
 import os

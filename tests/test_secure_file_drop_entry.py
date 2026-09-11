@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Тести CLI-аргументів точки входу (`--pswd`/`-p`) — Рівень 1 з
-docs/testing.md. Чисте парсування argparse, без відкриття GUI-вікна і
-без участі користувача.
-
-Запуск: python -m unittest discover -s tests -v
+Тести CLI-аргументів (--pswd/-p) — Рівень 1 з docs/testing.md, чисте argparse без GUI.
 """
 
 import unittest

@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Точка входу застосунку.
-
-Логіка розбита по шарах відповідальності (докладніше — docs/concept.md):
-  - connection.py — деривація ключа й хендшейк ("підключення");
-  - nat_traversal.py / stun_client.py — UPnP і STUN, теж "підключення";
-  - local_config.py — персистентний профіль користувача ("профіль");
-  - appearance.py — tkinter GUI ("зовнішність");
-  - exchange.py — підготовка даних до передачі ("обмін");
-  - tuning.py — конфігураційні параметри (датакласи), без магічних констант.
-
-Залежності: лише стандартна бібліотека Python (tkinter, hashlib, json,
-base64, secrets, zipfile, os, tempfile, socket, struct, urllib, xml,
-argparse, pathlib). Кросплатформенно (Windows/macOS/Linux), за умови що
-Python зібраний з Tk (стандартно для офіційних дистрибутивів).
+Точка входу застосунку. Мапа шарів і залежностей: docs/dev-notes.md → "secure_file_drop_entry.py".
 """
 
 import argparse
