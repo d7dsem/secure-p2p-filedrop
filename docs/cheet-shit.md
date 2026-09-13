@@ -68,3 +68,5 @@ python tests/_groups.py data -k prepare # група + unittest-фільтр
 ```
 
 Групи — [architecture.md](architecture.md). `test_transport.py` іноді флейкає (`KeyError`/`WinError 10053`) — відомий артефакт сетапу, не production-баг; деталі: [testing.md](testing.md).
+
+claude --resume 7e2ab0ea-078d-4040-9199-9c6d6a6f4592
