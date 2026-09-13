@@ -31,6 +31,30 @@ class AppearanceTestCase(unittest.TestCase):
         self._patch_env("HOME", home_dir)
         self._patch_env("USERPROFILE", home_dir)
 
+        # SecureFileClientApp.__init__ стартує РЕАЛЬНЕ мережеве налаштування
+        # (UPnP-discovery + STUN до публічного сервера) у фоновому потоці
+        # (_start_connection_setup, наприкінці __init__) — без цих патчів кожен
+        # GUI-тест робив би справжні мережеві виклики. Фейкають миттєвий провал
+        # обох рівнів (LAN-only фолбек) — тести, яким потрібна саме ця гілка,
+        # переозначають ці ж імена явно (WorkerBroadExceptionTests тощо).
+        import appearance as appearance_module
+        from nat_traversal import UpnpError
+        from stun_client import StunError
+
+        upnp_patcher = mock.patch.object(
+            appearance_module, "try_configure_port_forwarding",
+            side_effect=UpnpError("mocked — тест не має робити реальних мережевих викликів"),
+        )
+        upnp_patcher.start()
+        self.addCleanup(upnp_patcher.stop)
+
+        stun_patcher = mock.patch.object(
+            appearance_module, "get_public_address",
+            side_effect=StunError("mocked — тест не має робити реальних мережевих викликів"),
+        )
+        stun_patcher.start()
+        self.addCleanup(stun_patcher.stop)
+
         try:
             self.root = tk.Tk()
         except tk.TclError as e:
@@ -220,28 +244,28 @@ class GeneratePassphraseTests(AppearanceTestCase):
 
 
 class HandshakeTextCopyableTests(AppearanceTestCase):
-    """Регресія реального бага: text_out із state="disabled" блокував і виділення
-    мишею, тому ручне копіювання хендшейку мовчки нічого не копіювало.
-    Докладніше: docs/dev-notes.md → "appearance.py: text_out"."""
+    """Регресія реального бага: поле згенерованого хендшейку (тоді text_out) із
+    state="disabled" блокувало і виділення мишею, тому ручне копіювання мовчки
+    нічого не копіювало. Докладніше: docs/dev-notes.md → "appearance.py: text_out"."""
 
     def test_generated_handshake_is_selectable_via_sel_tag(self):
         self.app.var_passphrase.set("test-pass")
         self.app.on_generate_handshake()
-        content = self.app.text_out.get("1.0", "end").strip()
+        content = self.app.text_handshake.get("1.0", "end").strip()
         self.assertTrue(content)
 
-        self.app.text_out.tag_add("sel", "1.0", "end")
-        selected = self.app.text_out.get("sel.first", "sel.last").strip()
+        self.app.text_handshake.tag_add("sel", "1.0", "end")
+        selected = self.app.text_handshake.get("sel.first", "sel.last").strip()
         self.assertEqual(selected, content)
 
     def test_typing_into_generated_handshake_is_blocked(self):
         self.app.var_passphrase.set("test-pass")
         self.app.on_generate_handshake()
-        before = self.app.text_out.get("1.0", "end")
+        before = self.app.text_handshake.get("1.0", "end")
 
-        self.app.text_out.event_generate("<KeyPress-x>")
+        self.app.text_handshake.event_generate("<KeyPress-x>")
 
-        after = self.app.text_out.get("1.0", "end")
+        after = self.app.text_handshake.get("1.0", "end")
         self.assertEqual(before, after)
 
     def test_copy_works_via_keycode_even_with_foreign_keysym(self):
@@ -256,33 +280,50 @@ class HandshakeTextCopyableTests(AppearanceTestCase):
         self.app.root.update()
         self.app.var_passphrase.set("test-pass")
         self.app.on_generate_handshake()
-        content = self.app.text_out.get("1.0", "end").strip()
+        content = self.app.text_handshake.get("1.0", "end").strip()
         self.app.root.clipboard_clear()
 
-        self.app.text_out.focus_force()
+        self.app.text_handshake.focus_force()
         self.app.root.update()
-        self.app.text_out.event_generate("<Control-Key>", keycode=65, state=0x4)  # Ctrl+A
-        self.assertTrue(self.app.text_out.tag_ranges("sel"))
+        self.app.text_handshake.event_generate("<Control-Key>", keycode=65, state=0x4)  # Ctrl+A
+        self.assertTrue(self.app.text_handshake.tag_ranges("sel"))
 
-        self.app.text_out.event_generate("<Control-Key>", keycode=67, state=0x4)  # Ctrl+C
+        self.app.text_handshake.event_generate("<Control-Key>", keycode=67, state=0x4)  # Ctrl+C
         self.assertEqual(self.app.root.clipboard_get().strip(), content)
 
 
 class PasteWorksViaKeycodeTests(AppearanceTestCase):
-    """Регресія того самого бага (розкладка клавіатури) для Ctrl+V у text_in.
-    Докладніше: docs/dev-notes.md → "_bind_layout_independent_paste"."""
+    """Регресія того самого бага (розкладка клавіатури) для Ctrl+V у полі хендшейку —
+    тепер Ctrl+V == кнопка "Вставити хендшейк". Докладніше: docs/dev-notes.md →
+    "_make_readonly_selectable / keycode"."""
 
     def test_paste_works_via_keycode_even_with_foreign_keysym(self):
+        import appearance as appearance_module
+        from connection import build_handshake_packet
+        from transport import ConnectionFailed
+        from tuning import CONNECTION
+
+        patcher = mock.patch.object(
+            appearance_module, "establish_connection", side_effect=ConnectionFailed("mocked"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.app.var_iterations.set(str(CONNECTION.min_iterations))
+        self.app.var_passphrase.set("shared-pass")
+        text, _salt, _sid, _host = build_handshake_packet(CONNECTION.min_iterations, 52075, host="192.168.1.50")
+
         self.app.root.deiconify()  # синтетичні keyboard-події потребують реального фокуса
         self.app.root.update()
         self.app.root.clipboard_clear()
-        self.app.root.clipboard_append("layout-independent-paste-test")
-        self.app.text_in.focus_force()
+        self.app.root.clipboard_append(text)
+        self.app.text_handshake.focus_force()
         self.app.root.update()
 
-        self.app.text_in.event_generate("<Control-Key>", keycode=86, state=0x4)  # Ctrl+V
+        self.app.text_handshake.event_generate("<Control-Key>", keycode=86, state=0x4)  # Ctrl+V
 
-        self.assertEqual(self.app.text_in.get("1.0", "end").strip(), "layout-independent-paste-test")
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), text)
+        from appearance import _HANDSHAKE_KIND_PEER
+        self.assertEqual(self.app._handshake_kind, _HANDSHAKE_KIND_PEER)
 
 
 class InitialPortTests(AppearanceTestCase):
@@ -302,29 +343,707 @@ class InitialPortTests(AppearanceTestCase):
 
 
 class PasteHandshakeTests(AppearanceTestCase):
-    """on_paste_handshake — обхід Ctrl+V/контекстного меню, симетрично до
-    "Скопіювати в буфер". Докладніше: dev-notes.md."""
+    """on_paste_handshake — обхід Ctrl+V/контекстного меню. Вставлене одразу
+    обробляється; у полі з'являється лише після успішного розбору. Докладніше: dev-notes.md."""
 
-    def test_pastes_clipboard_content_into_text_in(self):
-        self.app.root.clipboard_clear()
-        self.app.root.clipboard_append("-----HANDSHAKE-----\nabc\n-----END-----")
-        self.app.on_paste_handshake()
-        self.assertEqual(
-            self.app.text_in.get("1.0", "end").strip(), "-----HANDSHAKE-----\nabc\n-----END-----"
-        )
+    def setUp(self):
+        super().setUp()
+        import appearance as appearance_module
+        from transport import ConnectionFailed
+        from tuning import CONNECTION
+        for target, kwargs in (
+            ("establish_connection", {"side_effect": ConnectionFailed("mocked")}),
+        ):
+            p = mock.patch.object(appearance_module, target, **kwargs)
+            p.start()
+            self.addCleanup(p.stop)
+        patcher = mock.patch("appearance.messagebox.showwarning")
+        self.mock_warn = patcher.start()
+        self.addCleanup(patcher.stop)
+        err_patcher = mock.patch("appearance.messagebox.showerror")
+        self.mock_error = err_patcher.start()
+        self.addCleanup(err_patcher.stop)
+        self.min_iterations = CONNECTION.min_iterations
+        self.app.var_iterations.set(str(self.min_iterations))
+        self.app.var_passphrase.set("shared-pass")
 
-    def test_replaces_existing_text_in_content(self):
-        self.app.text_in.insert("1.0", "old stale content")
+    def _packet(self, host: str = "192.168.1.50", port: int = 52075) -> str:
+        from connection import build_handshake_packet
+        return build_handshake_packet(self.min_iterations, port, host=host)[0]
+
+    def _paste(self, text: str):
         self.app.root.clipboard_clear()
-        self.app.root.clipboard_append("fresh content")
+        self.app.root.clipboard_append(text)
         self.app.on_paste_handshake()
-        self.assertEqual(self.app.text_in.get("1.0", "end").strip(), "fresh content")
+
+    def test_pastes_clipboard_content_into_handshake_field(self):
+        text = self._packet()
+        self._paste(text)
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), text)
+
+    def test_replaces_existing_peer_content(self):
+        self._paste(self._packet())
+        fresh = self._packet(host="10.0.0.9", port=52076)
+        with mock.patch("appearance.messagebox.askyesno", return_value=True):
+            self._paste(fresh)
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), fresh)
 
     def test_empty_clipboard_warns_without_crashing(self):
         self.app.root.clipboard_clear()
-        with mock.patch("appearance.messagebox.showwarning") as mock_warn:
+        self.app.on_paste_handshake()
+        self.mock_warn.assert_called_once()
+
+    def test_unparsable_clipboard_leaves_field_and_session_unchanged(self):
+        """Напр. скопійована парольна фраза не має з'явитись у полі незамаскованою."""
+        valid = self._packet()
+        self._paste(valid)
+        old_key = self.app.peer_key
+
+        with mock.patch("appearance.messagebox.askyesno") as mock_ask:
+            self._paste("my-secret-passphrase")
+
+        self.mock_error.assert_called_once()
+        mock_ask.assert_not_called()  # до запиту "новий сеанс?" не доходить
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), valid)
+        self.assertEqual(self.app.peer_key, old_key)
+        self.assertNotIn("my-secret-passphrase", self.app.text_log.get("1.0", "end"))
+
+    def test_unparsable_clipboard_on_empty_field_shows_nothing(self):
+        self._paste("my-secret-passphrase")
+        self.mock_error.assert_called_once()
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), "")
+
+    def _raw_packet(self, **overrides) -> str:
+        import base64
+        import json
+        from tuning import CONNECTION
+        packet = {"v": 2, "sid": "abcd", "salt": base64.b64encode(b"s" * 16).decode(),
+                  "iter": self.min_iterations, "host": "192.168.1.50", "port": 52075}
+        packet.update(overrides)
+        b64 = base64.urlsafe_b64encode(json.dumps(packet).encode()).decode()
+        return f"{CONNECTION.handshake_header}\n{b64}\n{CONNECTION.handshake_footer}"
+
+    def test_malformed_port_assigns_no_state(self):
+        for bad_port in ("abc", 0, 70000, None):
+            with self.subTest(port=bad_port):
+                self.mock_error.reset_mock()
+                self.app.on_process_incoming(raw_text=self._raw_packet(port=bad_port))
+                self.mock_error.assert_called_once()
+                self.assertIsNone(self.app.peer_key)
+                self.assertIsNone(self.app.peer_host)
+                self.assertIsNone(self.app.peer_port)
+                self.assertFalse(self.app._channel_thread_started)
+                self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), "")
+
+    def test_malformed_host_assigns_no_state(self):
+        self.app.on_process_incoming(raw_text=self._raw_packet(host=""))
+        self.mock_error.assert_called_once()
+        self.assertIsNone(self.app.peer_key)
+
+
+class HandshakeSectionTests(AppearanceTestCase):
+    """Секція "Хендшейк": ОДНЕ поле, БЕЗ перемикача ролі (ONE SESSION = ONE ROLE) —
+    "Згенерувати" одразу копіює, "Вставити хендшейк" одразу обробляє.
+    Докладніше: docs/dev-notes.md → "Секція «Хендшейк»".
+
+    establish_connection мокаємо — генерація/обробка одразу стартують фоновий потік
+    каналу, тест не має реально слухати/підключатись по мережі. Другу
+    генерацію/вставку в межах одного тесту супроводжує мокнутий askyesno=True
+    (підтверджений новий сеанс) — окремо перевірено в NewSessionConfirmationTests."""
+
+    def setUp(self):
+        super().setUp()
+        import appearance as appearance_module
+        from transport import ConnectionFailed
+        patcher = mock.patch.object(
+            appearance_module, "establish_connection",
+            side_effect=ConnectionFailed("mocked — жодного реального мережевого виклику в тесті"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        from tuning import CONNECTION
+        self.min_iterations = CONNECTION.min_iterations
+        self.app.var_iterations.set(str(self.min_iterations))  # швидша деривація; до хендшейку — без інвалідації
+        self.app.var_passphrase.set("shared-pass")
+
+    def _peer_handshake(self) -> tuple[str, bytes]:
+        from connection import build_handshake_packet
+        text, salt, _sid, _host = build_handshake_packet(self.min_iterations, 52075, host="192.168.1.50")
+        return text, salt
+
+    def _paste(self, text: str):
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(text)
+        self.app.on_paste_handshake()
+
+    def _paste_confirmed(self, text: str):
+        """_paste, але з мокнутим підтвердженням нового сеансу — для випадків,
+        коли сеанс уже активний (друга дія в тесті)."""
+        with mock.patch("appearance.messagebox.askyesno", return_value=True):
+            self._paste(text)
+
+    def test_caption_is_empty_hint_by_default(self):
+        from appearance import _HANDSHAKE_CAPTION_EMPTY
+        self.assertEqual(self.app.var_handshake_caption.get(), _HANDSHAKE_CAPTION_EMPTY)
+
+    def test_generate_copies_handshake_to_clipboard(self):
+        self.app.root.clipboard_clear()
+        self.app.on_generate_handshake()
+        content = self.app.text_handshake.get("1.0", "end").strip()
+        self.assertTrue(content)
+        self.assertEqual(self.app.root.clipboard_get(), content)
+
+    def test_generate_sets_mine_caption_and_kind(self):
+        from appearance import _HANDSHAKE_CAPTION_MINE, _HANDSHAKE_KIND_MINE
+        self.app.on_generate_handshake()
+        self.assertEqual(self.app._handshake_kind, _HANDSHAKE_KIND_MINE)
+        self.assertEqual(self.app.var_handshake_caption.get(), _HANDSHAKE_CAPTION_MINE)
+        self.assertIn("Код підтвердження: ", self.app.lbl_handshake_fp.cget("text"))
+        self.assertNotIn("—", self.app.lbl_handshake_fp.cget("text"))
+
+    def test_paste_sets_peer_caption_kind_and_processes(self):
+        from appearance import _HANDSHAKE_CAPTION_PEER, _HANDSHAKE_KIND_PEER
+        from connection import derive_key
+        peer_text, peer_salt = self._peer_handshake()
+
+        self._paste(peer_text)
+
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), peer_text)
+        self.assertEqual(self.app._handshake_kind, _HANDSHAKE_KIND_PEER)
+        self.assertEqual(self.app.var_handshake_caption.get(), _HANDSHAKE_CAPTION_PEER)
+        self.assertEqual(self.app.peer_key, derive_key("shared-pass", peer_salt, self.min_iterations))
+        self.assertEqual((self.app.peer_host, self.app.peer_port), ("192.168.1.50", 52075))
+
+    def test_ctrl_v_in_log_is_still_blocked(self):
+        """on_paste — лише для поля хендшейку; консоль лишається read-only."""
+        self.app.root.deiconify()
+        self.app.root.update()
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append("should-not-appear")
+        self.app.text_log.focus_force()
+        self.app.root.update()
+
+        self.app.text_log.event_generate("<Control-Key>", keycode=86, state=0x4)  # Ctrl+V
+
+        self.assertNotIn("should-not-appear", self.app.text_log.get("1.0", "end"))
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), "")
+
+    def test_invalidation_clears_handshake_text_and_caption(self):
+        from appearance import _HANDSHAKE_CAPTION_EMPTY
+        self.app.on_generate_handshake()
+
+        self.app.var_port.set("52099")
+
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), "")
+        self.assertIsNone(self.app._handshake_kind)
+        self.assertEqual(self.app.var_handshake_caption.get(), _HANDSHAKE_CAPTION_EMPTY)
+        self.assertEqual(self.app.lbl_handshake_fp.cget("text"), "Код підтвердження: —")
+
+    def test_only_one_key_set_after_switching_roles_and_session_key_matches_fingerprint(self):
+        """ONE SESSION = ONE ROLE: після Генерувати -> Вставити (з підтвердженням
+        скидання) щонайбільше один з local_key/peer_key колись встановлений, і
+        _session_key() відповідає коду підтвердження, показаному в полі."""
+        from connection import key_fingerprint
+
+        self.app.on_generate_handshake()
+        self.assertIsNotNone(self.app.local_key)
+        self.assertIsNone(self.app.peer_key)
+        self.assertEqual(self.app._session_key(), self.app.local_key)
+        self.assertIn(key_fingerprint(self.app.local_key), self.app.lbl_handshake_fp.cget("text"))
+
+        peer_text, _salt = self._peer_handshake()
+        self._paste_confirmed(peer_text)
+
+        self.assertIsNone(self.app.local_key)
+        self.assertIsNotNone(self.app.peer_key)
+        self.assertEqual(self.app._session_key(), self.app.peer_key)
+        self.assertIn(key_fingerprint(self.app.peer_key), self.app.lbl_handshake_fp.cget("text"))
+
+
+class NewSessionConfirmationTests(AppearanceTestCase):
+    """ONE SESSION = ONE ROLE: повторне "Згенерувати"/"Вставити хендшейк" (включно з
+    тим самим ще раз) при вже активному сеансі питає підтвердження
+    (_confirm_reset_if_needed, messagebox.askyesno). Докладніше: docs/dev-notes.md
+    → "Секція «Хендшейк»"."""
+
+    def setUp(self):
+        super().setUp()
+        import appearance as appearance_module
+        from transport import ConnectionFailed
+        patcher = mock.patch.object(
+            appearance_module, "establish_connection",
+            side_effect=ConnectionFailed("mocked — жодного реального мережевого виклику в тесті"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        from tuning import CONNECTION
+        self.min_iterations = CONNECTION.min_iterations
+        self.app.var_iterations.set(str(self.min_iterations))
+        self.app.var_passphrase.set("shared-pass")
+
+    def _peer_handshake(self, host: str = "192.168.1.50", port: int = 52075) -> str:
+        from connection import build_handshake_packet
+        text, _salt, _sid, _host = build_handshake_packet(self.min_iterations, port, host=host)
+        return text
+
+    def test_generate_again_declined_leaves_session_untouched(self):
+        self.app.on_generate_handshake()
+        old_key = self.app.local_key
+        old_text = self.app.text_handshake.get("1.0", "end").strip()
+
+        with mock.patch("appearance.messagebox.askyesno", return_value=False) as mock_ask:
+            self.app.on_generate_handshake()
+
+        mock_ask.assert_called_once()
+        self.assertEqual(self.app.local_key, old_key)
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), old_text)
+
+    def test_generate_again_confirmed_resets_and_regenerates(self):
+        self.app.on_generate_handshake()
+        old_key = self.app.local_key
+
+        with mock.patch("appearance.messagebox.askyesno", return_value=True) as mock_ask:
+            self.app.on_generate_handshake()
+
+        mock_ask.assert_called_once()
+        self.assertIsNotNone(self.app.local_key)
+        self.assertNotEqual(self.app.local_key, old_key)
+
+    def test_paste_again_declined_leaves_session_untouched(self):
+        first_text = self._peer_handshake()
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(first_text)
+        self.app.on_paste_handshake()
+        old_peer_key = self.app.peer_key
+
+        with mock.patch("appearance.messagebox.askyesno", return_value=False) as mock_ask:
+            self.app.root.clipboard_clear()
+            self.app.root.clipboard_append(self._peer_handshake(host="10.0.0.9", port=52076))
             self.app.on_paste_handshake()
+
+        mock_ask.assert_called_once()
+        self.assertEqual(self.app.peer_key, old_peer_key)
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), first_text)
+
+    def test_paste_again_confirmed_resets_and_reprocesses(self):
+        first_text = self._peer_handshake()
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(first_text)
+        self.app.on_paste_handshake()
+        old_peer_key = self.app.peer_key
+
+        second_text = self._peer_handshake(host="10.0.0.9", port=52076)
+        with mock.patch("appearance.messagebox.askyesno", return_value=True) as mock_ask:
+            self.app.root.clipboard_clear()
+            self.app.root.clipboard_append(second_text)
+            self.app.on_paste_handshake()
+
+        mock_ask.assert_called_once()
+        self.assertNotEqual(self.app.peer_key, old_peer_key)
+        self.assertEqual((self.app.peer_host, self.app.peer_port), ("10.0.0.9", 52076))
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), second_text)
+
+
+class EmptyPassphraseDialogTests(AppearanceTestCase):
+    """Порожня парольна фраза при "Згенерувати"/"Вставити хендшейк" — модальне
+    віконце (_prompt_passphrase), не messagebox-попередження. Докладніше:
+    docs/dev-notes.md → "Секція «Хендшейк»"."""
+
+    def setUp(self):
+        super().setUp()
+        import appearance as appearance_module
+        from transport import ConnectionFailed
+        patcher = mock.patch.object(
+            appearance_module, "establish_connection",
+            side_effect=ConnectionFailed("mocked — жодного реального мережевого виклику в тесті"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        from tuning import CONNECTION
+        self.min_iterations = CONNECTION.min_iterations
+        self.app.var_iterations.set(str(self.min_iterations))
+        # var_passphrase лишається порожньою навмисно.
+
+    def test_generate_with_empty_passphrase_prompts_and_uses_result(self):
+        with mock.patch.object(self.app, "_prompt_passphrase", return_value="typed-pass") as mock_prompt:
+            self.app.on_generate_handshake()
+
+        mock_prompt.assert_called_once()
+        self.assertEqual(self.app.var_passphrase.get(), "typed-pass")
+        self.assertIsNotNone(self.app.local_key)
+
+    def test_generate_with_empty_passphrase_cancelled_does_nothing(self):
+        with mock.patch.object(self.app, "_prompt_passphrase", return_value=None):
+            self.app.on_generate_handshake()
+
+        self.assertIsNone(self.app.local_key)
+        self.assertEqual(self.app.var_passphrase.get(), "")
+
+    def _peer_text(self) -> str:
+        from connection import build_handshake_packet
+        text, _salt, _sid, _host = build_handshake_packet(self.min_iterations, 52075, host="192.168.1.50")
+        return text
+
+    def test_paste_with_empty_passphrase_prompts_and_processes(self):
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(self._peer_text())
+
+        with mock.patch.object(self.app, "_prompt_passphrase", return_value="typed-pass") as mock_prompt:
+            self.app.on_paste_handshake()
+
+        mock_prompt.assert_called_once()
+        self.assertEqual(self.app.var_passphrase.get(), "typed-pass")
+        self.assertIsNotNone(self.app.peer_key)
+
+    def test_paste_with_empty_passphrase_cancelled_leaves_peer_key_unset(self):
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(self._peer_text())
+
+        with mock.patch.object(self.app, "_prompt_passphrase", return_value=None):
+            self.app.on_paste_handshake()
+
+        self.assertIsNone(self.app.peer_key)
+
+
+class VerificationMismatchTests(AppearanceTestCase):
+    """kind == "verification_failed" — діалог замість попередження
+    (_handle_verification_mismatch). Докладніше: docs/dev-notes.md →
+    "Секція «Хендшейк»"."""
+
+    def setUp(self):
+        super().setUp()
+        import appearance as appearance_module
+        from transport import ConnectionFailed
+        patcher = mock.patch.object(
+            appearance_module, "establish_connection",
+            side_effect=ConnectionFailed("mocked — жодного реального мережевого виклику в тесті"),
+        )
+        self.mock_establish = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        from tuning import CONNECTION
+        self.min_iterations = CONNECTION.min_iterations
+        self.app.var_iterations.set(str(self.min_iterations))
+        self.app.var_passphrase.set("shared-pass")
+
+    def _peer_text(self) -> str:
+        from connection import build_handshake_packet
+        text, _salt, _sid, _host = build_handshake_packet(self.min_iterations, 52075, host="192.168.1.50")
+        return text
+
+    def _mismatch_event(self, app=None) -> dict:
+        app = app or self.app
+        return {"epoch": app._session_epoch, "kind": "verification_failed", "error": "mismatch"}
+
+    def _wait_establish_calls(self, n: int):
+        """establish_connection викликається у фоновому потоці — дочекатись n викликів."""
+        import time
+        for _ in range(200):
+            if self.mock_establish.call_count >= n:
+                break
+            time.sleep(0.01)
+        self.assertEqual(self.mock_establish.call_count, n)
+
+    def test_peer_role_reprocesses_stored_text_and_restarts_channel(self):
+        peer_text = self._peer_text()
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(peer_text)
+        self.app.on_paste_handshake()
+        self.assertTrue(self.app._channel_thread_started)
+        self._wait_establish_calls(1)
+        old_peer_key = self.app.peer_key
+        epoch_before = self.app._session_epoch
+        old_stop_event = self.app._channel_stop_event
+
+        with mock.patch.object(self.app, "_prompt_passphrase", return_value="fixed-pass") as mock_prompt:
+            self.app._handle_channel_event(self._mismatch_event())
+
+        mock_prompt.assert_called_once()
+        self.assertEqual(self.app.var_passphrase.get(), "fixed-pass")
+        # Збережений текст переобробляється без повторного копіювання з буфера.
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), peer_text)
+        self.assertIsNotNone(self.app.peer_key)
+        self.assertNotEqual(self.app.peer_key, old_peer_key)
+        self.assertEqual((self.app.peer_host, self.app.peer_port), ("192.168.1.50", 52075))
+        self.assertTrue(self.app._channel_thread_started)  # встановлення каналу перезапущено
+        self.assertGreater(self.app._session_epoch, epoch_before)
+        self.assertTrue(old_stop_event.is_set())
+        self._wait_establish_calls(2)
+        self.assertIn("інша сторона", self.app.var_channel_status.get())
+
+    def test_mine_role_retry_keeps_handshake_material_and_relistens(self):
+        from connection import derive_key, key_fingerprint
+        self.app.on_generate_handshake()
+        self._wait_establish_calls(1)
+        salt, sid = self.app.local_salt, self.app.local_session_id
+        old_key = self.app.local_key
+        old_text = self.app.text_handshake.get("1.0", "end").strip()
+        epoch_before = self.app._session_epoch
+        old_stop_event = self.app._channel_stop_event
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append("untouched")
+
+        with mock.patch.object(self.app, "_prompt_passphrase", return_value="fixed-pass-2") as mock_prompt:
+            self.app._handle_channel_event(self._mismatch_event())
+
+        mock_prompt.assert_called_once()
+        self.assertEqual(self.app.var_passphrase.get(), "fixed-pass-2")
+        self.assertEqual(self.app.local_salt, salt)
+        self.assertEqual(self.app.local_session_id, sid)
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), old_text)
+        self.assertEqual(self.app.root.clipboard_get(), "untouched")  # нічого пересилати не треба
+        self.assertEqual(self.app.local_key, derive_key("fixed-pass-2", salt, self.min_iterations))
+        self.assertNotEqual(self.app.local_key, old_key)
+        self.assertIn(key_fingerprint(self.app.local_key), self.app.lbl_handshake_fp.cget("text"))
+        self.assertGreater(self.app._session_epoch, epoch_before)
+        self.assertTrue(old_stop_event.is_set())
+        self.assertFalse(self.app._channel_stop_event.is_set())
+        self.assertTrue(self.app._channel_thread_started)
+        self._wait_establish_calls(2)
+        self.assertIn("інша сторона", self.app.var_channel_status.get())
+
+    def test_generator_and_joiner_retry_with_same_passphrase_produce_equal_keys(self):
+        from appearance import SecureFileClientApp
+        joiner = SecureFileClientApp(self.root)
+        joiner.var_iterations.set(str(self.min_iterations))
+        joiner.var_passphrase.set("typo-pass")
+
+        self.app.on_generate_handshake()  # генератор: "shared-pass", текст — у буфері
+        joiner.on_paste_handshake()
+        self.assertNotEqual(self.app.local_key, joiner.peer_key)
+
+        for app in (self.app, joiner):
+            with mock.patch.object(app, "_prompt_passphrase", return_value="shared-pass"):
+                app._handle_channel_event(self._mismatch_event(app))
+
+        self.assertIsNotNone(self.app.local_key)
+        self.assertEqual(self.app.local_key, joiner.peer_key)
+        self.assertIsNone(self.app.peer_key)
+        self.assertIsNone(joiner.local_key)
+
+    def test_manual_passphrase_edit_after_retry_still_fully_resets(self):
+        self.app.on_generate_handshake()
+        with mock.patch.object(self.app, "_prompt_passphrase", return_value="fixed-pass"):
+            self.app._handle_channel_event(self._mismatch_event())
+        self.assertIsNotNone(self.app.local_salt)
+
+        self.app.var_passphrase.set("typed-by-hand")
+
+        self.assertIsNone(self.app.local_key)
+        self.assertIsNone(self.app.local_salt)
+        self.assertIsNone(self.app.local_session_id)
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), "")
+
+    def test_peer_cancel_keeps_state_and_explains_how_to_retry(self):
+        peer_text = self._peer_text()
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(peer_text)
+        self.app.on_paste_handshake()
+        old_peer_key = self.app.peer_key
+        old_passphrase = self.app.var_passphrase.get()
+        epoch_before = self.app._session_epoch
+
+        with mock.patch.object(self.app, "_prompt_passphrase", return_value=None) as mock_prompt:
+            self.app._handle_channel_event(self._mismatch_event())
+
+        mock_prompt.assert_called_once()
+        self.assertEqual(self.app.peer_key, old_peer_key)
+        self.assertEqual(self.app.var_passphrase.get(), old_passphrase)
+        self.assertEqual(self.app._session_epoch, epoch_before)  # не перепідключається
+        self.assertIn("НЕ збігаються", self.app.var_channel_status.get())
+        self.assertIn("вставте хендшейк", self.app.var_channel_status.get())
+
+    def test_mine_cancel_keeps_key_and_keeps_listening(self):
+        self.app.on_generate_handshake()
+        self._wait_establish_calls(1)
+        old_key = self.app.local_key
+        epoch_before = self.app._session_epoch
+
+        with mock.patch.object(self.app, "_prompt_passphrase", return_value=None):
+            self.app._handle_channel_event(self._mismatch_event())
+
+        self.assertEqual(self.app.local_key, old_key)
+        self.assertEqual(self.app.var_passphrase.get(), "shared-pass")
+        self.assertGreater(self.app._session_epoch, epoch_before)
+        self.assertTrue(self.app._channel_thread_started)
+        self._wait_establish_calls(2)
+        self.assertIn("слухаю", self.app.var_channel_status.get())
+
+    def test_mismatch_dialog_deferred_while_other_modal_open(self):
+        self.app.on_generate_handshake()
+        self.app._modal_depth = 1
+        with mock.patch.object(self.app, "_prompt_passphrase") as mock_prompt:
+            self.app._handle_channel_event(self._mismatch_event())
+        mock_prompt.assert_not_called()
+        self.assertEqual(len(self.app._deferred_channel_events), 1)
+
+    def test_mismatch_dialog_result_ignored_if_session_reset_meanwhile(self):
+        self.app.on_generate_handshake()
+
+        def _prompt_and_reset(*_a, **_kw):
+            self.app._reset_session_state()
+            return "fixed-pass"
+
+        with mock.patch.object(self.app, "_prompt_passphrase", side_effect=_prompt_and_reset):
+            self.app._handle_channel_event(self._mismatch_event())
+
+        self.assertIsNone(self.app.local_key)
+        self.assertEqual(self.app.var_passphrase.get(), "shared-pass")
+
+    def test_non_verification_error_is_connection_failed_without_dialog(self):
+        """transport: обрив/таймаут під час verify_channel -> ConnectionFailed (не VerificationError)."""
+        import appearance as appearance_module
+        from transport import ConnectionFailed
+        for exc in (ConnectionFailed("connection reset during verify"), OSError("connection reset raw")):
+            with self.subTest(exc=type(exc).__name__):
+                sock = mock.MagicMock()
+                self.mock_establish.side_effect = None
+                self.mock_establish.return_value = sock
+                with mock.patch.object(appearance_module, "verify_channel", side_effect=exc):
+                    self.app._channel_establish_worker(b"k" * 32, self.app._session_epoch)
+
+                event = self.app._channel_queue.get_nowait()
+                self.assertEqual(event["kind"], "connection_failed")
+                sock.close.assert_called_once()
+                with mock.patch.object(self.app, "_prompt_passphrase") as mock_prompt:
+                    self.app._handle_channel_event(event)
+                mock_prompt.assert_not_called()
+                self.assertIn(str(exc), self.app.var_channel_status.get())
+
+    def test_verification_error_is_verification_failed(self):
+        import appearance as appearance_module
+        from transport import VerificationError
+        self.mock_establish.side_effect = None
+        self.mock_establish.return_value = mock.MagicMock()
+        with mock.patch.object(appearance_module, "verify_channel", side_effect=VerificationError("nope")):
+            self.app._channel_establish_worker(b"k" * 32, self.app._session_epoch)
+        self.assertEqual(self.app._channel_queue.get_nowait()["kind"], "verification_failed")
+
+    def test_connection_failed_message_shown_in_channel_status(self):
+        self.app._handle_channel_event({
+            "epoch": self.app._session_epoch, "kind": "connection_failed",
+            "error": "Не вдалось слухати на порту 52075: порт зайнятий",
+        })
+        self.assertIn("порт зайнятий", self.app.var_channel_status.get())
+
+
+class IterationsValidationTests(AppearanceTestCase):
+    """Ітерації нижче CONNECTION.min_iterations — гарантована розбіжність ключів
+    (сторона, що вставляє, затискає знизу), тому відхиляються при генерації."""
+
+    def test_iterations_below_min_rejected_on_generate(self):
+        from tuning import CONNECTION
+        self.app.var_passphrase.set("shared-pass")
+        self.app.var_iterations.set(str(CONNECTION.min_iterations - 1))
+        with mock.patch("appearance.messagebox.showerror") as mock_error:
+            self.app.on_generate_handshake()
+        mock_error.assert_called_once()
+        self.assertIn(str(CONNECTION.min_iterations), mock_error.call_args[0][1])
+        self.assertIsNone(self.app.local_key)
+
+
+class PollChannelEventsTests(AppearanceTestCase):
+    """_poll_channel_events — виняток в одному обробнику не зупиняє наступні події й перепланування."""
+
+    def test_exception_in_handler_does_not_stop_processing(self):
+        self.app._channel_queue.put({"epoch": self.app._session_epoch, "kind": "a"})
+        self.app._channel_queue.put({"epoch": self.app._session_epoch, "kind": "b"})
+        with mock.patch.object(
+            self.app, "_handle_channel_event", side_effect=[RuntimeError("boom"), None]
+        ) as mock_handle, mock.patch.object(self.app.root, "after") as mock_after:
+            self.app._poll_channel_events()
+        self.assertEqual(mock_handle.call_count, 2)
+        mock_after.assert_called_once_with(200, self.app._poll_channel_events)
+        self.assertIn("boom", self.app.text_log.get("1.0", "end"))
+
+    def test_stale_connected_event_socket_is_closed(self):
+        sock = mock.MagicMock()
+        self.app._handle_channel_event(
+            {"epoch": self.app._session_epoch - 1, "kind": "connected", "socket": sock, "key": b"k" * 32}
+        )
+        sock.close.assert_called_once()
+        self.assertIsNone(self.app.channel_socket)
+        self.assertFalse(self.app.channel_verified)
+
+
+class ArchiveKeyMatchesChannelKeyTests(AppearanceTestCase):
+    """AES-архів має бути зашифрований ключем підтвердженого каналу; скидання сеансу
+    видаляє такий архів. Докладніше: dev-notes.md → "Секція «Хендшейк»"."""
+
+    def setUp(self):
+        super().setUp()
+        import appearance as appearance_module
+        from transport import ConnectionFailed
+        from tuning import CONNECTION
+        patcher = mock.patch.object(
+            appearance_module, "establish_connection", side_effect=ConnectionFailed("mocked"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.app.var_iterations.set(str(CONNECTION.min_iterations))
+        self.app.var_passphrase.set("shared-pass")
+
+    def test_send_disabled_when_archive_key_differs_from_channel_key(self):
+        self.app.transfer_payload = ["x.zip"]
+        self.app._transfer_archive_key = b"a" * 32
+        self.app.channel_verified = True
+        self.app.channel_socket = mock.MagicMock()
+        self.app.channel_key = b"b" * 32
+        self.app._update_send_button_state()
+        self.assertEqual(str(self.app.btn_send["state"]), "disabled")
+
+        with mock.patch("appearance.messagebox.showwarning") as mock_warn, \
+                mock.patch("appearance.send_files") as mock_send:
+            self.app.on_send_files()
         mock_warn.assert_called_once()
+        mock_send.assert_not_called()
+
+        self.app.channel_key = b"a" * 32
+        self.app._update_send_button_state()
+        self.assertEqual(str(self.app.btn_send["state"]), "normal")
+
+    def _prepare_encrypted_archive(self) -> str:
+        from appearance import _ENCRYPTION_LEVEL_LABELS
+        from exchange import EncryptionLevel
+        send_dir = tempfile.mkdtemp(prefix="test_appearance_send_")
+        self.addCleanup(shutil.rmtree, send_dir, ignore_errors=True)
+        with open(os.path.join(send_dir, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("a")
+        self.app._select_send_dir(send_dir)
+        self.app.var_encryption_label.set(_ENCRYPTION_LEVEL_LABELS[EncryptionLevel.AES256])
+        self.app.on_generate_handshake()
+        self.app.on_initiate_transfer()
+        self.assertEqual(self.app._transfer_archive_key, self.app.local_key)
+        self.assertTrue(os.path.exists(self.app.packed_archive_path))
+        return self.app.packed_archive_path
+
+    def test_full_reset_clears_encrypted_payload(self):
+        archive = self._prepare_encrypted_archive()
+        self.app.var_port.set("52099")  # ручна зміна параметра — повне скидання
+        self.assertIsNone(self.app.transfer_payload)
+        self.assertIsNone(self.app.packed_archive_path)
+        self.assertIsNone(self.app._transfer_archive_key)
+        self.assertFalse(os.path.exists(archive))
+        self.assertIn("Ініціалізувати передачу", self.app.var_transfer_status.get())
+
+    def test_retry_reset_clears_encrypted_payload(self):
+        archive = self._prepare_encrypted_archive()
+        with mock.patch.object(self.app, "_prompt_passphrase", return_value="fixed-pass"):
+            self.app._handle_channel_event(
+                {"epoch": self.app._session_epoch, "kind": "verification_failed", "error": "x"}
+            )
+        self.assertIsNone(self.app.transfer_payload)
+        self.assertFalse(os.path.exists(archive))
+
+    def test_unencrypted_payload_survives_reset(self):
+        self.app.on_generate_handshake()
+        self.app.transfer_payload = ["plain.txt"]
+        self.app._transfer_archive_key = None
+        self.app.var_port.set("52099")
+        self.assertEqual(self.app.transfer_payload, ["plain.txt"])
 
 
 class IsPrivateHostTests(unittest.TestCase):
@@ -508,11 +1227,17 @@ class TestChannelButtonTests(AppearanceTestCase):
         self.app.channel_socket = mock.MagicMock()
 
         with mock.patch.object(appearance_module, "send_ping", side_effect=OSError("broken pipe")):
-            self.app._test_channel_worker(self.app._session_epoch)  # напряму, без потоку
+            self.app._test_channel_worker(self.app.channel_socket, self.app._session_epoch)  # без потоку
 
         event = self.app._channel_queue.get_nowait()
         self.assertEqual(event["kind"], "channel_test_failed")
         self.assertIn("broken pipe", event["error"])
+
+    def test_socket_reset_before_worker_start_reports_failure(self):
+        """Скидання сеансу між кліком і стартом потоку: None-сокет — подія, не мовчазна смерть."""
+        self.app._test_channel_worker(None, self.app._session_epoch)
+        event = self.app._channel_queue.get_nowait()
+        self.assertEqual(event["kind"], "channel_test_failed")
 
 
 class WorkerBroadExceptionTests(AppearanceTestCase):
@@ -533,12 +1258,24 @@ class WorkerBroadExceptionTests(AppearanceTestCase):
         with mock.patch.object(
             appearance_module, "receive_files", side_effect=KeyError("name")
         ):
-            self.app._receive_worker(self.app._session_epoch)
+            self.app._receive_worker(self.app.channel_socket, self.app.channel_key, self.app._session_epoch)
 
         event = self.app._channel_queue.get_nowait()
         self.assertEqual(event["kind"], "receive_error")
         self.assertIn("KeyError", event["error"])
         self.assertEqual(event["epoch"], self.app._session_epoch)
+
+    def test_receive_worker_uses_passed_socket_and_exits_on_stale_epoch(self):
+        import appearance as appearance_module
+        own_sock, own_key = object(), b"o" * 32
+        with mock.patch.object(appearance_module, "receive_files", side_effect=KeyError("x")) as mock_recv:
+            self.app._receive_worker(own_sock, own_key, self.app._session_epoch)
+        self.assertIs(mock_recv.call_args[0][0], own_sock)
+        self.assertIs(mock_recv.call_args[0][1], own_key)
+
+        with mock.patch.object(appearance_module, "receive_files") as mock_recv:
+            self.app._receive_worker(own_sock, own_key, self.app._session_epoch - 1)
+        mock_recv.assert_not_called()
 
     def test_send_worker_reports_unexpected_exception(self):
         import appearance as appearance_module
@@ -565,6 +1302,8 @@ class WorkerBroadExceptionTests(AppearanceTestCase):
         self.assertIn("RuntimeError", event["error"])
 
     def test_channel_establish_worker_reports_unexpected_verify_exception(self):
+        """Не-VerificationError під час підтвердження — мережева помилка (connection_failed),
+        не розбіжність ключів: діалог виправлення фрази тут недоречний."""
         import appearance as appearance_module
 
         dummy_socket = mock.MagicMock()
@@ -576,7 +1315,7 @@ class WorkerBroadExceptionTests(AppearanceTestCase):
             self.app._channel_establish_worker(b"k" * 32, self.app._session_epoch)
 
         event = self.app._channel_queue.get_nowait()
-        self.assertEqual(event["kind"], "verification_failed")
+        self.assertEqual(event["kind"], "connection_failed")
         self.assertIn("RuntimeError", event["error"])
         dummy_socket.close.assert_called_once()
 
@@ -615,7 +1354,7 @@ class InvalidateSessionOnParamChangeTests(AppearanceTestCase):
 
         self.assertIsNone(self.app.local_key)
         self.assertGreater(self.app._session_epoch, epoch_before)
-        self.assertEqual(self.app.text_out.get("1.0", "end").strip(), "")
+        self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), "")
         self.assertIn("змінено", self.app.var_channel_status.get())
 
     def test_changing_passphrase_after_generate_invalidates_session(self):

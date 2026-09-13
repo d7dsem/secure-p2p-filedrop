@@ -5,10 +5,12 @@
 """
 
 import base64
+import hmac
 import ipaddress
 import os
 import queue
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -49,6 +51,42 @@ def _is_private_host(host: str) -> bool:
     except ValueError:
         return False  # хостнейм (не голий IP) — вважаємо непрозорим, без спекуляцій
 
+
+def _close_socket(sock) -> None:
+    """shutdown(SHUT_RDWR) перед close() — інакше на Linux заблокований recv() у фоновому
+    потоці (_receive_worker) не прокидається. None/вже закритий — тихо ігноруємо."""
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except (OSError, AttributeError):
+        pass
+    try:
+        sock.close()
+    except (OSError, AttributeError):
+        pass
+
+
+def _parse_incoming_handshake(text: str) -> dict:
+    """Розбирає й валідує чужий хендшейк ДО будь-якої зміни стану. Кидає Exception
+    (ValueError/KeyError/binascii.Error...) на побитому пакеті. Повертає salt/iterations/
+    host/port/sid."""
+    packet = parse_handshake_packet(text)
+    salt = base64.b64decode(packet["salt"])
+    # Нижня межа — захист від підробленого/зниженого "iter" у чужому пакеті,
+    # що змусило б слабшу деривацію ключа (dev-notes.md).
+    iterations = max(int(packet["iter"]), CONNECTION.min_iterations)
+    host = packet["host"]
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("Некоректна адреса (host) у хендшейку.")
+    port = packet["port"]
+    if isinstance(port, bool) or not isinstance(port, (int, str)):
+        raise ValueError("Некоректний порт у хендшейку.")
+    port = int(port)
+    if not (CONNECTION.min_port <= port <= CONNECTION.max_port):
+        raise ValueError(f"Порт у хендшейку поза межами {CONNECTION.min_port}..{CONNECTION.max_port}: {port}.")
+    return {"salt": salt, "iterations": iterations, "host": host.strip(), "port": port, "sid": packet["sid"]}
+
 # Людяні підписи для Combobox шифрування; ключ — те, що реально йде в build_archive_from_selection.
 _ENCRYPTION_LEVEL_LABELS = {
     EncryptionLevel.NONE: "Без шифрування (передача у відкриту — нульова безпека)",
@@ -57,14 +95,32 @@ _ENCRYPTION_LEVEL_LABELS = {
 }
 _ENCRYPTION_LABEL_TO_LEVEL = {label: level for level, label in _ENCRYPTION_LEVEL_LABELS.items()}
 
+# Секція "Хендшейк": одне поле, без перемикача ролі — ОДИН сеанс = ОДНА роль (хто
+# генерує, хто вставляє). "Роль" (_HANDSHAKE_KIND_*) — суто внутрішній прапорець,
+# який з двох сценаріїв повтору після розбіжності ключів застосувати (знову слухати з
+# тими самими salt/sid vs переобробити збережений текст); користувачу не показується
+# перемикачем. dev-notes.md → "Секція «Хендшейк»".
+_HANDSHAKE_KIND_MINE = "mine"
+_HANDSHAKE_KIND_PEER = "peer"
+_FINGERPRINT_PLACEHOLDER = "Код підтвердження: —"
+_HANDSHAKE_CAPTION_EMPTY = (
+    "Немає активного хендшейку. Натисніть «Згенерувати» (якщо ви ініціюєте обмін) "
+    "або «Вставити хендшейк» (якщо отримали текст від співрозмовника)."
+)
+_HANDSHAKE_CAPTION_MINE = "Ваш хендшейк — скопійовано в буфер, надішліть співрозмовнику."
+_HANDSHAKE_CAPTION_PEER = "Хендшейк співрозмовника."
+_NEW_SESSION_CONFIRM_TITLE = "Новий сеанс?"
+_NEW_SESSION_CONFIRM_MESSAGE = "Почати новий сеанс? Поточний хендшейк і канал буде скинуто."
+
 _HELP_TEXT = """Як користуватись
 
-1. Обидві сторони вводять ОДНАКОВУ парольну фразу (не передається мережею) — або одна сторона тисне "Згенерувати" й передає готову фразу іншій тим самим каналом, що й хендшейк.
-2. Сторона A: "Згенерувати хендшейк" → копіює текст → надсилає стороні B через месенджер (Signal/Telegram тощо).
-3. Сторона B: вставляє отриманий текст → "Обробити вхідний хендшейк".
-4. Обидві сторони звіряють короткий код підтвердження (голосом/текстом через той самий месенджер) — мають збігатись.
-5. З'єднання встановлюється й підтверджується автоматично (UPnP → STUN → LAN), без додаткових дій.
-6. Оберіть файл або каталог, за потреби — архівування/шифрування/стиснення → "Ініціалізувати передачу" → "Надіслати".
+1. Обидві сторони вводять ОДНАКОВУ парольну фразу (не передається мережею) — або одна сторона тисне "Згенерувати" біля пароля й передає готову фразу іншій тим самим каналом, що й хендшейк. Якщо натиснути "Згенерувати"/"Вставити хендшейк" із порожньою фразою — з'явиться віконце для її введення.
+2. Сторона A: у секції "Хендшейк" — "Згенерувати" (текст одразу копіюється в буфер обміну) → надсилає стороні B через месенджер (Signal/Telegram тощо).
+3. Сторона B: копіює отриманий текст → "Вставити хендшейк" (або Ctrl+V у полі) — хендшейк вставляється й одразу обробляється. Підпис над полем показує, що зараз у ньому: власний хендшейк чи хендшейк співрозмовника.
+4. Обидві сторони звіряють короткий код підтвердження (голосом/текстом через той самий месенджер) — мають збігатись. Якщо не збігаються — з'явиться віконце для виправлення фрази й повторної спроби (без ручного копіювання наново).
+5. Один сеанс — одна роль: якщо хендшейк уже згенеровано чи оброблено, повторне натискання "Згенерувати"/"Вставити хендшейк" запитає підтвердження — почати новий сеанс (поточний хендшейк і канал буде скинуто).
+6. З'єднання встановлюється й підтверджується автоматично (UPnP → STUN → LAN), без додаткових дій.
+7. Оберіть файл або каталог, за потреби — архівування/шифрування/стиснення → "Ініціалізувати передачу" → "Надіслати".
 
 Особливості безпеки
 
@@ -91,6 +147,10 @@ class SecureFileClientApp:
         self.local_key: bytes | None = None
         self.local_salt: bytes | None = None
         self.local_session_id: str | None = None
+        # Параметри ЗГЕНЕРОВАНОГО хендшейку, потрібні для повтору після розбіжності ключів
+        # без нового пакета (_retry_after_mismatch) — dev-notes.md → "Секція «Хендшейк»".
+        self.local_iterations: int | None = None
+        self._local_handshake_net: str = ""
 
         self.peer_key: bytes | None = None
         self.peer_host: str | None = None
@@ -100,6 +160,9 @@ class SecureFileClientApp:
         self.selected_is_dir: bool = False
         self.packed_archive_path: str | None = None  # окремо від selected_path — див. dev-notes.md
         self.transfer_payload: list[str] | None = None  # фінальний payload для передачі
+        # Ключ, яким зашифровано підготовлений AES-архів (None — payload від ключа не залежить).
+        # "Надіслати" дозволено лише якщо він == channel_key — dev-notes.md → "Секція «Хендшейк»".
+        self._transfer_archive_key: bytes | None = None
 
         self.local_port: int | None = None  # локальний порт, на якому реально слухаємо (не public_port)
         self.channel_socket = None  # встановлений і підтверджений сокет (transport.py) або None
@@ -115,6 +178,17 @@ class SecureFileClientApp:
         # спроби (їх не можна перервати на льоту) позначають свої події старим epoch,
         # і _handle_channel_event їх ігнорує. dev-notes.md.
         self._session_epoch: int = 0
+        # Сигналізує ПОТОЧНОМУ _channel_establish_worker зупинитись якнайшвидше (dev-notes.md →
+        # "_reset_session_state — звільнення порту"); при скиданні сеансу замінюється на новий
+        # екземпляр — старий лишається "сетнутим" для потоку попередньої спроби, що вже його тримає.
+        self._channel_stop_event: threading.Event = threading.Event()
+        # True лише на час програмної зміни var_passphrase під час повтору після розбіжності —
+        # trace не має скидати хендшейк (_invalidate_session_if_active).
+        self._suppress_param_invalidation: bool = False
+        # >0 поки відкрите модальне віконце (askyesno/_prompt_passphrase) — verification_failed
+        # відкладається, щоб діалоги не накладались (_handle_channel_event).
+        self._modal_depth: int = 0
+        self._deferred_channel_events: list[dict] = []
 
         # rel_path (POSIX "/") -> чи включено; дефолт — усе включено (запис лише при зміні).
         self._file_tree_checked: dict[str, bool] = {}
@@ -152,11 +226,7 @@ class SecureFileClientApp:
         self.root.after(200, self._poll_channel_events)
 
     def _on_close(self):
-        if self.channel_socket is not None:
-            try:
-                self.channel_socket.close()
-            except OSError:
-                pass
+        _close_socket(self.channel_socket)
         self.root.destroy()
 
     def _set_window_icon(self):
@@ -278,12 +348,14 @@ class SecureFileClientApp:
     _KEYCODE_V = 86
     _KEYCODE_INSERT = 45
 
-    def _make_readonly_selectable(self, text_widget) -> None:
+    def _make_readonly_selectable(self, text_widget, on_paste=None) -> None:
         """Текст лишається виділюваним/копійованим (Ctrl+C, виділення мишею), але без
         редагування — на відміну від state="disabled", який у Tk блокує й виділення теж.
         Ctrl+C/Ctrl+A виконуються ЯВНО (event_generate/tag_add), а не просто "пропускаються"
         далі — інакше довелось би покладатись на штатний Tk-біндинг, який має ту саму
-        проблему з розкладкою, що й вирішуємо тут. Докладніше: docs/dev-notes.md →
+        проблему з розкладкою, що й вирішуємо тут. on_paste — якщо задано, Ctrl+V (теж за
+        keycode) викликає його замість вставки в сам віджет (поле хендшейку: Ctrl+V ==
+        кнопка "Вставити хендшейк"). Докладніше: docs/dev-notes.md →
         "appearance.py: _make_readonly_selectable"."""
         navigation_keys = {"Left", "Right", "Up", "Down", "Prior", "Next", "Home", "End", "Tab"}
 
@@ -297,22 +369,12 @@ class SecureFileClientApp:
                 if event.keycode == self._KEYCODE_A:
                     text_widget.tag_add("sel", "1.0", "end")
                     return "break"
+                if on_paste is not None and event.keycode == self._KEYCODE_V:
+                    on_paste()
+                    return "break"
             return "break"
 
         text_widget.bind("<Key>", _block_edit)
-
-    def _bind_layout_independent_paste(self, widget) -> None:
-        """Ctrl+V через keycode фізичної клавіші — той самий обхід нелатинської
-        розкладки клавіатури, що й _make_readonly_selectable. Не замінює штатний
-        Tk-біндинг (який далі теж працює під латинською розкладкою), а доповнює його —
-        "Вставити з буфера" лишається надійним фолбеком у будь-якому разі."""
-        def _on_key(event):
-            if event.state & 0x4 and event.keycode == self._KEYCODE_V:
-                widget.event_generate("<<Paste>>")
-                return "break"
-            return None
-
-        widget.bind("<Key>", _on_key)
 
     def _make_reserved_label(self, parent, text: str, wraplength: int, height: int, **pack_kwargs) -> ttk.Label:
         """Label у Frame фіксованої висоти — щоб ріст тексту (1->N рядків) не двигав вікно.
@@ -451,55 +513,46 @@ class SecureFileClientApp:
             anchor="nw", fill="both"
         )
 
-        # --- Секція: вихідний хендшейк ---
-        frame_out = ttk.LabelFrame(parent, text="Мій хендшейк (надіслати через месенджер)")
-        frame_out.pack(fill="x", **pad)
+        # --- Секція: хендшейк — ОДНЕ поле, БЕЗ перемикача ролі: один сеанс = одна
+        # роль (dev-notes.md → "Секція «Хендшейк»"). "Згенерувати" й "Вставити
+        # хендшейк" — обидві дії, що можуть почати новий сеанс (з підтвердженням,
+        # якщо старий ще активний, _confirm_reset_if_needed). Підпис над полем
+        # (var_handshake_caption) відображає, що зараз у полі — не перемикач.
+        frame_handshake = ttk.LabelFrame(parent, text="Хендшейк")
+        frame_handshake.pack(fill="x", **pad)
 
-        btns_out = ttk.Frame(frame_out)
-        btns_out.pack(fill="x", padx=8, pady=(8, 4))
+        self._handshake_kind: str | None = None  # _HANDSHAKE_KIND_MINE/_PEER — лише внутрішній стан
+        self._handshake_text: str = ""
+        self._handshake_fingerprint: str = _FINGERPRINT_PLACEHOLDER
+
+        self.var_handshake_caption = tk.StringVar(value=_HANDSHAKE_CAPTION_EMPTY)
+        ttk.Label(
+            frame_handshake, textvariable=self.var_handshake_caption, wraplength=340, justify="left"
+        ).pack(fill="x", padx=8, pady=(8, 4), anchor="w")
+
+        btns_handshake = ttk.Frame(frame_handshake)
+        btns_handshake.pack(fill="x", padx=8, pady=(0, 4))
         ttk.Button(
-            btns_out, text="Згенерувати хендшейк", style="Accent.TButton",
+            btns_handshake, text="Згенерувати", style="Accent.TButton",
             command=self.on_generate_handshake,
         ).pack(side="left")
         ttk.Button(
-            btns_out, text="Скопіювати в буфер", command=self.on_copy_handshake
+            btns_handshake, text="Вставити хендшейк", style="Accent.TButton",
+            command=self.on_paste_handshake,
         ).pack(side="left", padx=8)
 
-        self.text_out = scrolledtext.ScrolledText(
-            frame_out, height=APPEARANCE.text_widget_height, wrap="char", font=self._mono_font
+        self.text_handshake = scrolledtext.ScrolledText(
+            frame_handshake, height=APPEARANCE.text_widget_height, wrap="char", font=self._mono_font
         )
-        self.text_out.pack(fill="x", padx=8, pady=(0, 4))
-        self._style_text_widget(self.text_out)
-        # Не state="disabled" — блокує й виділення мишею (dev-notes.md), а хендшейк
-        # звідси саме й треба вручну виділяти/копіювати.
-        self._make_readonly_selectable(self.text_out)
+        self.text_handshake.pack(fill="x", padx=8, pady=(0, 4))
+        self._style_text_widget(self.text_handshake)
+        # Не state="disabled" — блокує й виділення мишею (dev-notes.md), а згенерований
+        # хендшейк звідси треба й вручну виділяти/копіювати. Ctrl+V (за keycode, незалежно
+        # від розкладки) == "Вставити хендшейк" — вставка йде лише через on_paste_handshake.
+        self._make_readonly_selectable(self.text_handshake, on_paste=self.on_paste_handshake)
 
-        self.lbl_local_fp = self._make_reserved_label(
-            frame_out, "Код підтвердження: —", wraplength=340, height=40, padx=8, pady=(0, 8)
-        )
-
-        # --- Секція: вхідний хендшейк ---
-        frame_in = ttk.LabelFrame(parent, text="Хендшейк співрозмовника (вставити з месенджера)")
-        frame_in.pack(fill="x", **pad)
-
-        self.text_in = scrolledtext.ScrolledText(
-            frame_in, height=APPEARANCE.text_widget_height, wrap="char", font=self._mono_font
-        )
-        self.text_in.pack(fill="x", padx=8, pady=8)
-        self._style_text_widget(self.text_in)
-        self._bind_layout_independent_paste(self.text_in)
-
-        btns_in = ttk.Frame(frame_in)
-        btns_in.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Button(
-            btns_in, text="Вставити з буфера", command=self.on_paste_handshake
-        ).pack(side="left")
-        ttk.Button(
-            btns_in, text="Обробити вхідний хендшейк", command=self.on_process_incoming
-        ).pack(side="left", padx=(8, 0))
-
-        self.lbl_peer_fp = self._make_reserved_label(
-            frame_in, "Код підтвердження ключа: —", wraplength=340, height=40, padx=8, pady=(0, 4)
+        self.lbl_handshake_fp = self._make_reserved_label(
+            frame_handshake, _FINGERPRINT_PLACEHOLDER, wraplength=340, height=40, padx=8, pady=(0, 8)
         )
 
         # --- Секція: канал передачі — автоматично, щойно відомі local_key і
@@ -508,8 +561,9 @@ class SecureFileClientApp:
         frame_channel = ttk.LabelFrame(parent, text="Канал передачі")
         frame_channel.pack(fill="x", **pad)
         self.var_channel_status = tk.StringVar(value="Очікування хендшейку з обох сторін...")
+        # 80px — статус може містити текст помилки з transport (напр. "порт зайнятий"), не лише 1-2 рядки.
         channel_label = self._make_reserved_label(
-            frame_channel, "", wraplength=340, height=40, padx=8, pady=8,
+            frame_channel, "", wraplength=340, height=80, padx=8, pady=8,
         )
         channel_label.configure(textvariable=self.var_channel_status)
         ttk.Button(frame_channel, text="Перевірити канал", command=self.on_test_channel).pack(
@@ -716,13 +770,18 @@ class SecureFileClientApp:
     # ---- допоміжне ------------------------------------------------------
 
     def _get_iterations(self) -> int | None:
+        """Нижче CONNECTION.min_iterations відхиляємо: сторона, що вставляє, затискає "iter"
+        знизу до min_iterations (_parse_incoming_handshake) — ключі гарантовано розійшлися б."""
         try:
             n = int(self.var_iterations.get())
-            if n <= 0:
+            if n < CONNECTION.min_iterations:
                 raise ValueError
             return n
         except ValueError:
-            messagebox.showerror("Помилка", "Кількість ітерацій має бути додатним цілим числом.")
+            messagebox.showerror(
+                "Помилка",
+                f"Кількість ітерацій має бути цілим числом не менше {CONNECTION.min_iterations}.",
+            )
             return None
 
     def _get_port(self) -> int | None:
@@ -743,11 +802,176 @@ class SecureFileClientApp:
 
     # ---- обробники подій -------------------------------------------------
 
+    def _prompt_passphrase(self, title: str, message: str, initial: str = "") -> str | None:
+        """Модальне віконце введення парольної фрази — заміна messagebox-попередження
+        при порожній фразі (Генерувати/Вставити) і засіб виправити фразу після
+        розбіжності кодів підтвердження (verification_failed). Маскування узгоджене
+        з entry_passphrase (чекбокс "Показати"); Enter=OK, Esc=Cancel. Повертає
+        непорожній введений текст або None (Cancel/порожньо/закрито хрестиком).
+        Докладніше: docs/dev-notes.md → "_prompt_passphrase"."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.configure(bg=APPEARANCE.dark_bg)
+
+        result: dict = {"value": None}
+
+        ttk.Label(dialog, text=message, wraplength=360, justify="left").pack(
+            padx=12, pady=(12, 6), anchor="w"
+        )
+
+        var_value = tk.StringVar(value=initial)
+        row = ttk.Frame(dialog)
+        row.pack(fill="x", padx=12, pady=(0, 6))
+        entry = ttk.Entry(row, textvariable=var_value, show="*")
+        entry.pack(side="left", fill="x", expand=True)
+        var_show = tk.BooleanVar(value=False)
+        self._make_checkbutton(
+            row, "Показати", var_show,
+            lambda: entry.configure(show="" if var_show.get() else "*"),
+        ).pack(side="left", padx=(6, 0))
+
+        btns = ttk.Frame(dialog)
+        btns.pack(fill="x", padx=12, pady=(0, 12))
+
+        def _ok(_event=None):
+            result["value"] = var_value.get()
+            dialog.destroy()
+
+        def _cancel(_event=None):
+            dialog.destroy()
+
+        ttk.Button(btns, text="OK", style="Accent.TButton", command=_ok).pack(side="left")
+        ttk.Button(btns, text="Скасувати", command=_cancel).pack(side="left", padx=8)
+
+        dialog.bind("<Return>", _ok)
+        dialog.bind("<Escape>", _cancel)
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+        entry.focus_set()
+
+        self._modal_depth += 1
+        try:
+            dialog.grab_set()
+            self.root.wait_window(dialog)
+        finally:
+            self._modal_depth -= 1
+
+        return result["value"] or None
+
+    def _session_active(self) -> bool:
+        """Чи вже стартовано сеанс (ключ дериновано і/або канал уже встановлюється/
+        встановлено) — визначає, чи потрібне підтвердження перед новим
+        Генерувати/Вставити (ONE SESSION = ONE ROLE, dev-notes.md)."""
+        return (
+            self.local_key is not None or self.peer_key is not None
+            or self.channel_socket is not None or self._channel_thread_started
+        )
+
+    def _confirm_reset_if_needed(self) -> bool:
+        """Якщо сеанс уже активний — питає підтвердження й, у разі згоди, скидає
+        стан. Повертає True, якщо викликач може продовжувати дію (сеансу не було
+        АБО скидання підтверджено); False — користувач відмовився, дію потрібно
+        перервати без жодних змін стану."""
+        if not self._session_active():
+            return True
+        self._modal_depth += 1  # verification_failed під час askyesno відкладається (_handle_channel_event)
+        try:
+            confirmed = messagebox.askyesno(_NEW_SESSION_CONFIRM_TITLE, _NEW_SESSION_CONFIRM_MESSAGE)
+        finally:
+            self._modal_depth -= 1
+        if not confirmed:
+            return False
+        self._reset_session_state()
+        self._log("Новий сеанс підтверджено користувачем — попередній хендшейк і канал скинуто.")
+        return True
+
+    def _reset_session_state(self):
+        """Повністю скидає стан сеансу: епоху (застарілі фонові потоки більше не
+        мають ефекту — dev-notes.md → "_session_epoch"), ключі, адресу іншої
+        сторони, канал, текст/код хендшейку. Спільна логіка для
+        _invalidate_session_if_active (зміна параметра хендшейку) і
+        _confirm_reset_if_needed (свідомий новий сеанс). Після скидання щонайбільше
+        один із local_key/peer_key колись знову буде встановлений — _session_key()."""
+        self._reset_channel_attempt()
+
+        self.local_key = None
+        self.local_salt = None
+        self.local_session_id = None
+        self.local_iterations = None
+        self._local_handshake_net = ""
+        self.peer_key = None
+        self.peer_host = None
+        self.peer_port = None
+        self.local_port = None
+
+        self._handshake_kind = None
+        self._handshake_text = ""
+        self._handshake_fingerprint = _FINGERPRINT_PLACEHOLDER
+        self._render_handshake_field()
+        self._update_send_button_state()
+
+    def _reset_channel_attempt(self):
+        """Скидає лише СПРОБУ каналу, не хендшейк: епоха, stop_event, сокет, channel_key,
+        прапорці, зашифрований payload. Спільна частина повного скидання
+        (_reset_session_state) і повтору після розбіжності ключів (_retry_after_mismatch),
+        де salt/sid/текст хендшейку мають лишитись."""
+        self._session_epoch += 1  # застарілі фонові потоки з попередньої спроби більше не мають ефекту
+
+        # Сигналізує ПОТОЧНОМУ _channel_establish_worker (якщо ще працює) зупинитись
+        # якнайшвидше — інакше його listening-сокет тримає local_port ще до
+        # TRANSPORT.connect_timeout_seconds (300с). Новий Event — для НАСТУПНОЇ спроби;
+        # establish_connection реагує на stop_event у межах accept_poll_timeout_seconds
+        # (0.5с) — port звільняється швидко, хоч сам застарілий потік ще донесе (і
+        # _handle_channel_event проігнорує за epoch) свою подію пізніше.
+        # Докладніше: docs/dev-notes.md → "_reset_session_state — звільнення порту".
+        self._channel_stop_event.set()
+        self._channel_stop_event = threading.Event()
+
+        _close_socket(self.channel_socket)
+        self.channel_socket = None
+        self.channel_key = None
+        self.channel_verified = False
+        self._channel_thread_started = False
+        self._channel_pending = False
+        self._discard_key_bound_payload()
+        self._update_send_button_state()
+
+    def _discard_key_bound_payload(self):
+        """AES-архів зашифровано ключем попередньої спроби — після скидання він не
+        відповідатиме новому channel_key. Видаляємо (файл створює сам застосунок у
+        EXCHANGE.pack_subdir_name) і просимо ініціалізувати передачу заново."""
+        if self._transfer_archive_key is None:
+            return
+        archive = self.packed_archive_path
+        if archive and os.path.basename(os.path.dirname(archive)) == EXCHANGE.pack_subdir_name:
+            try:
+                os.remove(archive)
+            except OSError:
+                pass
+        self._transfer_archive_key = None
+        self.packed_archive_path = None
+        self.transfer_payload = None
+        if self.selected_path and self.selected_is_dir:
+            self.lbl_selected.configure(text=f"Каталог: {self.selected_path}")
+        self.var_transfer_status.set(
+            "Сеанс змінено — зашифрований архів скинуто. Натисніть «Ініціалізувати передачу» ще раз."
+        )
+        self._log("Зашифрований архів скинуто (ключ сеансу змінився) — потрібна повторна ініціалізація передачі.")
+
     def on_generate_handshake(self):
+        if not self._confirm_reset_if_needed():
+            return
+
         passphrase = self.var_passphrase.get()
         if not passphrase:
-            messagebox.showwarning("Увага", "Спочатку введіть парольну фразу.")
-            return
+            passphrase = self._prompt_passphrase(
+                "Парольна фраза", "Введіть парольну фразу, щоб згенерувати хендшейк.",
+            )
+            if passphrase is None:
+                return
+            self.var_passphrase.set(passphrase)  # сеанс ще неактивний — trace нічого не скине
+
         iterations = self._get_iterations()
         if iterations is None:
             return
@@ -764,71 +988,109 @@ class SecureFileClientApp:
         )
         self.local_salt = salt
         self.local_session_id = session_id
+        self.local_iterations = iterations
+        self._local_handshake_net = f"{host}:{effective_port}"
         self.local_key = derive_key(passphrase, salt, iterations)
         self.local_port = port  # порт, на якому РЕАЛЬНО слухатимемо (не effective_port — dev-notes.md)
 
-        self.text_out.delete("1.0", "end")
-        self.text_out.insert("1.0", text)
+        self._show_handshake(_HANDSHAKE_KIND_MINE, text, self._local_fingerprint_text())
+        # Одразу в буфер — окремої кнопки "Скопіювати" нема; ручне виділення в полі теж працює.
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
 
         host_kind = _HOST_SOURCE_LABELS[self.public_host_source]
-        self.lbl_local_fp.configure(
-            text=f"Код підтвердження: {key_fingerprint(self.local_key)}  "
-                 f"(sid={session_id}, net={host}:{effective_port})"
-        )
-        self._set_status("Хендшейк згенеровано. Надішліть його через месенджер.")
+        self._set_status("Хендшейк згенеровано й скопійовано в буфер обміну. Надішліть його через месенджер.")
         self._log(
             f"Хендшейк згенеровано: sid={session_id}, net={host}:{effective_port} ({host_kind}), "
             f"iter={iterations}."
         )
         self._maybe_start_channel_establishment()
 
-    def on_copy_handshake(self):
-        content = self.text_out.get("1.0", "end").strip()
-        if not content:
-            messagebox.showwarning("Увага", "Спочатку згенеруйте хендшейк.")
-            return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(content)
-        self._set_status("Хендшейк скопійовано в буфер обміну.")
+    def _local_fingerprint_text(self) -> str:
+        return (
+            f"Код підтвердження: {key_fingerprint(self.local_key)}  "
+            f"(sid={self.local_session_id}, net={self._local_handshake_net})"
+        )
+
+    def _render_handshake_field(self):
+        """Показує в полі поточний текст/код і підпис над полем (порожньо/"Ваш
+        хендшейк"/"Хендшейк співрозмовника" — залежно від _handshake_kind)."""
+        self.text_handshake.delete("1.0", "end")
+        self.text_handshake.insert("1.0", self._handshake_text)
+        self.lbl_handshake_fp.configure(text=self._handshake_fingerprint)
+        caption = {
+            _HANDSHAKE_KIND_MINE: _HANDSHAKE_CAPTION_MINE,
+            _HANDSHAKE_KIND_PEER: _HANDSHAKE_CAPTION_PEER,
+        }.get(self._handshake_kind, _HANDSHAKE_CAPTION_EMPTY)
+        self.var_handshake_caption.set(caption)
+
+    def _show_handshake(self, kind: str, text: str, fingerprint: str):
+        """Записує поточний вміст/код і його "роль" (лише внутрішній прапорець —
+        генерація → MINE, вставка → PEER) і перемальовує поле/підпис."""
+        self._handshake_kind = kind
+        self._handshake_text = text
+        self._handshake_fingerprint = fingerprint
+        self._render_handshake_field()
 
     def on_paste_handshake(self):
         """Вставляє вміст буфера обміну напряму (root.clipboard_get()), в обхід
         Ctrl+V/контекстного меню — Tk-віджети Text не мають штатного контекстного
-        меню "Вставити", а надійність самого Ctrl+V залежить від фокусу. Симетрично
-        до "Скопіювати в буфер" (on_copy_handshake). Докладніше: dev-notes.md."""
+        меню "Вставити", а надійність самого Ctrl+V залежить від фокусу. Одразу
+        обробляє вставлене (окремої кнопки "Обробити" нема) — симетрично до
+        "Згенерувати", що одразу копіює. Спочатку читає буфер (щоб порожній буфер
+        не запускав дарма запит підтвердження нового сеансу), потім, якщо сеанс уже
+        активний, питає підтвердження (_confirm_reset_if_needed). Вміст буфера показується
+        в полі лише після успішного розбору — інакше випадково скопійована, напр., фраза
+        з'явилась би в полі незамаскованою. Докладніше: dev-notes.md."""
         try:
             content = self.root.clipboard_get()
         except tk.TclError:
             messagebox.showwarning("Увага", "Буфер обміну порожній або не містить тексту.")
             return
-        self.text_in.delete("1.0", "end")
-        self.text_in.insert("1.0", content)
-        self._set_status("Вставлено з буфера обміну.")
+        try:
+            _parse_incoming_handshake(content)
+        except Exception as e:
+            # Текст буфера в лог/діалог не пишемо — там може бути секрет (напр. фраза).
+            messagebox.showerror(
+                "Помилка розбору хендшейку",
+                f"Буфер обміну не містить коректного хендшейку ({type(e).__name__}).",
+            )
+            self._log(f"Вставка хендшейку — ПОМИЛКА розбору: {type(e).__name__}.")
+            return
+        if not self._confirm_reset_if_needed():
+            return
+        self.on_process_incoming(raw_text=content)
 
-    def on_process_incoming(self):
+    def on_process_incoming(self, raw_text: str | None = None):
+        """Обробляє raw_text (вставка з буфера або збережений текст при повторі після
+        розбіжності ключів — _retry_after_mismatch), за замовчуванням self._handshake_text.
+        Розбір і валідація (host/port) — ДО будь-якої зміни стану; текст з'являється в
+        полі лише після успіху."""
         passphrase = self.var_passphrase.get()
         if not passphrase:
-            messagebox.showwarning("Увага", "Спочатку введіть парольну фразу.")
-            return
+            passphrase = self._prompt_passphrase(
+                "Парольна фраза", "Введіть парольну фразу, щоб обробити вставлений хендшейк.",
+            )
+            if passphrase is None:
+                return
+            self.var_passphrase.set(passphrase)  # peer_key ще не виставлено -> trace тут безпечний
 
-        raw_text = self.text_in.get("1.0", "end")
+        text = raw_text if raw_text is not None else self._handshake_text
         try:
-            packet = parse_handshake_packet(raw_text)
-            salt = base64.b64decode(packet["salt"])
-            # Нижня межа — захист від підробленого/зниженого "iter" у чужому пакеті,
-            # що змусило б слабшу деривацію ключа (dev-notes.md).
-            iterations = max(int(packet["iter"]), CONNECTION.min_iterations)
+            parsed = _parse_incoming_handshake(text)  # увесь розбір/валідація — ДО зміни стану
         except Exception as e:
             messagebox.showerror("Помилка розбору хендшейку", str(e))
-            self._log(f"Обробка вхідного хендшейку — ПОМИЛКА: {e}")
+            self._log(f"Обробка вхідного хендшейку — ПОМИЛКА: {type(e).__name__}: {e}")
             return
 
-        self.peer_key = derive_key(passphrase, salt, iterations)
-        self.peer_host = packet["host"]
-        self.peer_port = int(packet["port"])
-        self.lbl_peer_fp.configure(
-            text=f"Код підтвердження ключа: {key_fingerprint(self.peer_key)}  "
-                 f"(sid={packet['sid']}, net={self.peer_host}:{self.peer_port})"
+        iterations = parsed["iterations"]
+        self.peer_key = derive_key(passphrase, parsed["salt"], iterations)
+        self.peer_host = parsed["host"]
+        self.peer_port = parsed["port"]
+        self._show_handshake(
+            _HANDSHAKE_KIND_PEER, text,
+            f"Код підтвердження: {key_fingerprint(self.peer_key)}  "
+            f"(sid={parsed['sid']}, net={self.peer_host}:{self.peer_port})",
         )
         self._set_status(
             "Ключ з вхідного хендшейку отримано. "
@@ -836,19 +1098,97 @@ class SecureFileClientApp:
             "вони мають збігатися."
         )
         self._log(
-            f"Вхідний хендшейк оброблено: sid={packet['sid']}, "
+            f"Вхідний хендшейк оброблено: sid={parsed['sid']}, "
             f"net={self.peer_host}:{self.peer_port}, iter={iterations}."
         )
         self._maybe_start_channel_establishment()
 
+    def _handle_verification_mismatch(self):
+        """kind == "verification_failed": замість попередження — віконце з поясненням
+        і полем для виправленої фрази. Повтор — на ТОМУ САМОМУ хендшейку, нічого
+        пересилати не треба (dev-notes.md → "Секція «Хендшейк»"). OK:
+        - роль PEER (ця сторона вставляла) — переобробляє ЗБЕРЕЖЕНИЙ текст з новою
+          фразою і знову підключається (connect-цикл чекає, поки інша сторона слухатиме);
+        - роль MINE (ця сторона генерувала) — ті самі salt/sid/iterations/текст, local_key
+          переводиться з нової фрази, знову слухає.
+        Cancel: MINE — слухає далі з ПОТОЧНОЮ фразою (помилка могла бути в іншої сторони,
+        її виправлений повтор має до кого підключитись); PEER — не підключається, статус
+        пояснює, як повторити."""
+        epoch = self._session_epoch
+        new_passphrase = self._prompt_passphrase(
+            "Ключі не збігаються",
+            "Коди підтвердження відрізняються — ймовірно, одруківка в парольній фразі. "
+            "Звірте короткі коди підтвердження з іншою стороною (голосом/текстом через "
+            "месенджер). Введіть виправлену фразу, щоб спробувати ще раз — хендшейк "
+            "пересилати не треба, інша сторона теж має натиснути OK.",
+            initial=self.var_passphrase.get(),
+        )
+        if epoch != self._session_epoch:
+            return  # поки діалог був відкритий, сеанс скинуто/змінено — повтор уже неактуальний
+        if new_passphrase is None:
+            if self._handshake_kind == _HANDSHAKE_KIND_MINE and self.local_key is not None:
+                self._retry_after_mismatch(None)
+                self.var_channel_status.set(
+                    f"Ключі НЕ збігаються — слухаю на порту {self.local_port} з поточною фразою"
+                )
+                self._set_status(
+                    "Ключі не збігаються. Слухаю далі з поточною фразою — якщо помилка у вас, "
+                    "змініть фразу (скине хендшейк) або дочекайтесь повтору іншої сторони."
+                )
+            else:
+                self.var_channel_status.set(
+                    "Ключі НЕ збігаються — повторне з'єднання не виконується. "
+                    "Щоб повторити, вставте хендшейк ще раз."
+                )
+            return
+        self._retry_after_mismatch(new_passphrase)
+
+    def _retry_after_mismatch(self, new_passphrase: str | None):
+        """Повтор після verification_failed БЕЗ нового хендшейку. new_passphrase=None —
+        лише перезапуск слухання (MINE, Cancel). var_passphrase змінюється з вимкненим
+        trace (_suppress_param_invalidation) — повне скидання стерло б salt/sid/текст;
+        скидається лише спроба каналу (_reset_channel_attempt)."""
+        kind = self._handshake_kind
+        stored_text = self._handshake_text
+        self._reset_channel_attempt()
+        if new_passphrase is not None:
+            self._suppress_param_invalidation = True
+            try:
+                self.var_passphrase.set(new_passphrase)
+            finally:
+                self._suppress_param_invalidation = False
+
+        if kind == _HANDSHAKE_KIND_PEER:
+            self.peer_key = None
+            self.on_process_incoming(raw_text=stored_text)
+            if self._channel_pending:
+                self.var_channel_status.set(
+                    f"Повтор: з'єднуюсь з {self.peer_host}:{self.peer_port} — "
+                    f"чекаю, поки інша сторона теж натисне OK"
+                )
+            return
+
+        if kind != _HANDSHAKE_KIND_MINE or self.local_salt is None or self.local_iterations is None:
+            return
+        if new_passphrase is not None:
+            self.local_key = derive_key(new_passphrase, self.local_salt, self.local_iterations)
+            self._show_handshake(_HANDSHAKE_KIND_MINE, stored_text, self._local_fingerprint_text())
+            self._log(f"Повтор після розбіжності ключів: sid={self.local_session_id}, ключ переведено з нової фрази.")
+        self._maybe_start_channel_establishment()
+        if new_passphrase is not None and self._channel_pending:
+            self.var_channel_status.set(
+                f"Повтор: слухаю на порту {self.local_port} — чекаю, поки інша сторона теж натисне OK"
+            )
+            self._set_status("Повтор з тим самим хендшейком — пересилати його не треба.")
+
     # ---- канал передачі (сервісна функція + Фаза 3, transport.py) --------
 
     def _session_key(self) -> bytes | None:
-        """Спільний сесійний ключ ЦІЄЇ сторони. Хто ЗГЕНЕРУВАВ хендшейк — його ключ
-        у local_key; хто лише ОБРОБИВ чужий вхідний хендшейк — ключ у peer_key
-        (дерivований із salt іншої сторони). peer_key має пріоритет: обробка чужого
-        хендшейку — явна дія "приєднатись до сеансу іншої сторони"."""
-        return self.peer_key if self.peer_key is not None else self.local_key
+        """Спільний сесійний ключ ЦІЄЇ сторони. ONE SESSION = ONE ROLE (dev-notes.md):
+        щонайбільше одне з local_key/peer_key будь-коли встановлене (гарантія —
+        _reset_session_state/_confirm_reset_if_needed), тому пріоритет не потрібен —
+        просто повертаємо те, що є."""
+        return self.local_key if self.local_key is not None else self.peer_key
 
     def _invalidate_session_if_active(self, *_trace_args):
         """trace на var_passphrase/var_iterations/var_port — будь-яка зміна одного з них
@@ -857,39 +1197,13 @@ class SecureFileClientApp:
         порт — саме так знайдено реальний баг). Скидає стан і повідомляє про потребу
         повторного обміну хендшейком, замість мовчки лишати застарілий канал.
         Докладніше: docs/dev-notes.md → "_invalidate_session_if_active"."""
-        session_active = (
-            self.local_key is not None or self.peer_key is not None
-            or self.channel_socket is not None or self._channel_thread_started
-        )
-        if not session_active:
+        if self._suppress_param_invalidation:
+            return  # програмна зміна фрази під час повтору (_retry_after_mismatch) — хендшейк лишається
+        if not self._session_active():
             return  # нічого ще не було згенеровано/оброблено — звичайне введення пароля
 
-        self._session_epoch += 1  # застарілі фонові потоки з попередньої спроби більше не мають ефекту
-
-        if self.channel_socket is not None:
-            try:
-                self.channel_socket.close()
-            except OSError:
-                pass
-
-        self.local_key = None
-        self.local_salt = None
-        self.local_session_id = None
-        self.peer_key = None
-        self.peer_host = None
-        self.peer_port = None
-        self.local_port = None
-        self.channel_socket = None
-        self.channel_key = None
-        self.channel_verified = False
-        self._channel_thread_started = False
-        self._channel_pending = False
-
-        self.text_out.delete("1.0", "end")
-        self.lbl_local_fp.configure(text="Код підтвердження: —")
-        self.lbl_peer_fp.configure(text="Код підтвердження ключа: —")
+        self._reset_session_state()
         self.var_channel_status.set("Параметри змінено — попередній хендшейк і канал недійсні.")
-        self._update_send_button_state()
         self._set_status(
             "Параметри хендшейку змінено — згенеруйте/обробіть хендшейк заново й "
             "надішліть його іншій стороні повторно."
@@ -932,7 +1246,12 @@ class SecureFileClientApp:
             self.var_channel_status.set(f"Слухаю на порту {self.local_port} — чекаю на іншу сторону...")
             self._log(f"Канал передачі: слухаю на порту {self.local_port}, чекаю підключення.")
         epoch = self._session_epoch
-        threading.Thread(target=self._channel_establish_worker, args=(session_key, epoch), daemon=True).start()
+        # Знімок self._channel_stop_event ЗАРАЗ — щоб наступний _reset_session_state (новий
+        # Event) сигналізував СААМЕ цій спробі зупинитись, не майбутній (dev-notes.md).
+        stop_event = self._channel_stop_event
+        threading.Thread(
+            target=self._channel_establish_worker, args=(session_key, epoch, stop_event), daemon=True
+        ).start()
         self.root.after(1000, self._tick_channel_wait, epoch)
 
     def _tick_channel_wait(self, epoch: int):
@@ -950,14 +1269,23 @@ class SecureFileClientApp:
         event["epoch"] = epoch
         self._channel_queue.put(event)
 
-    def _channel_establish_worker(self, session_key: bytes, epoch: int):
+    def _channel_establish_worker(
+        self, session_key: bytes, epoch: int, stop_event: threading.Event | None = None
+    ):
         """Фоновий потік — жодних звернень до self.root/tkinter, лише мережа й запис у чергу.
         Широкі except Exception — щоб неочікувана помилка не вбила потік мовчки (dev-notes.md).
         epoch — знімок self._session_epoch на момент старту; якщо параметри хендшейку
         зміняться, поки цей потік ще працює (перервати сокет-виклики на льоту не можна),
-        _handle_channel_event ігнорує його події як застарілі."""
+        _handle_channel_event ігнорує його події як застарілі. stop_event — знімок
+        self._channel_stop_event на момент старту (див. _maybe_start_channel_establishment) —
+        establish_connection перевіряє його під час очікування й звільняє listening-сокет
+        (порт) протягом accept_poll_timeout_seconds після скидання сеансу, а не аж до
+        connect_timeout_seconds; параметр опційний (за замовчуванням — поточний
+        self._channel_stop_event) лише для сумісності з прямими викликами з тестів."""
+        if stop_event is None:
+            stop_event = self._channel_stop_event
         try:
-            sock = establish_connection(self.local_port, self.peer_host, self.peer_port)
+            sock = establish_connection(self.local_port, self.peer_host, self.peer_port, stop_event=stop_event)
         except ConnectionFailed as e:
             self._put_channel_event(epoch, {"kind": "connection_failed", "error": str(e)})
             return
@@ -966,31 +1294,51 @@ class SecureFileClientApp:
             return
         try:
             verify_channel(sock, session_key)
-        except VerificationError as e:
-            sock.close()
-            self._put_channel_event(epoch, {"kind": "verification_failed", "error": str(e)})
-            return
         except Exception as e:
-            sock.close()
-            self._put_channel_event(epoch, {"kind": "verification_failed", "error": f"{type(e).__name__}: {e}"})
+            _close_socket(sock)
+            # Лише VerificationError = справжня розбіжність ключів (діалог виправлення фрази).
+            # Обрив/таймаут/будь-що інше під час підтвердження — мережева помилка, не одруківка.
+            if isinstance(e, VerificationError):
+                self._put_channel_event(epoch, {"kind": "verification_failed", "error": str(e)})
+            else:
+                self._put_channel_event(epoch, {"kind": "connection_failed", "error": f"{type(e).__name__}: {e}"})
             return
         self._put_channel_event(epoch, {"kind": "connected", "socket": sock, "key": session_key})
 
     def _poll_channel_events(self):
         """Персистентний опитувач self._channel_queue — стартує в __init__ і
-        працює весь час роботи застосунку (безпечно, черга здебільшого порожня)."""
+        працює весь час роботи застосунку (безпечно, черга здебільшого порожня).
+        Виняток в одному обробнику логуються й не зупиняє наступні події/перепланування."""
         try:
             while True:
-                event = self._channel_queue.get_nowait()
-                self._handle_channel_event(event)
-        except queue.Empty:
-            pass
-        self.root.after(200, self._poll_channel_events)
+                try:
+                    event = self._channel_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle_channel_event(event)
+                except Exception as e:
+                    # Лише тип події й виняток — сама подія може містити ключ/сокет.
+                    self._log(f"Помилка обробки події каналу '{event.get('kind')}': {type(e).__name__}: {e}")
+        finally:
+            deferred, self._deferred_channel_events = self._deferred_channel_events, []
+            for event in deferred:
+                self._channel_queue.put(event)
+            self.root.after(200, self._poll_channel_events)
 
     def _handle_channel_event(self, event: dict):
         if event.get("epoch") != self._session_epoch:
-            return  # застаріла подія з потоку попереднього сеансу (dev-notes.md) — ігноруємо
+            # Застаріла подія з потоку попереднього сеансу (dev-notes.md) — ігноруємо, але
+            # сокет, який вона несе, закриваємо: інакше з'єднання висить до кінця роботи.
+            _close_socket(event.get("socket"))
+            return
         kind = event["kind"]
+
+        if kind == "verification_failed" and self._modal_depth > 0:
+            # Відкрите інше модальне віконце (напр. "Почати новий сеанс?") — не накладаємо
+            # діалог; _poll_channel_events поверне подію в чергу, після скидання вона застаріє.
+            self._deferred_channel_events.append(event)
+            return
 
         if kind == "connection_failed":
             self._channel_pending = False
@@ -1000,19 +1348,13 @@ class SecureFileClientApp:
                     f" Адреса {self.peer_host} публічна — ймовірна причина: NAT hairpin/loopback "
                     f"не підтримується роутером (типово при тестуванні двох сторін за одним роутером)."
                 )
-            self.var_channel_status.set(f"Не вдалось встановити з'єднання.{hint}")
+            self.var_channel_status.set(f"Не вдалось встановити з'єднання: {event['error']}{hint}")
             self._log(f"Канал передачі: {event['error']}{hint}")
 
         elif kind == "verification_failed":
             self._channel_pending = False
-            self.var_channel_status.set("Ключі НЕ збігаються — звірте код підтвердження вручну.")
             self._log(f"Канал передачі: {event['error']}")
-            messagebox.showwarning(
-                "Ключі не збігаються",
-                "Підтвердження ключа провалилось — коди підтвердження (у секціях хендшейку "
-                "вище) з обох сторін відрізняються. Типова причина: одруківка в парольній "
-                "фразі. Звірте короткі коди голосом/текстом через месенджер.",
-            )
+            self._handle_verification_mismatch()
 
         elif kind == "connected":
             self._channel_pending = False
@@ -1022,7 +1364,9 @@ class SecureFileClientApp:
             self.var_channel_status.set("Підтверджено — канал готовий до передачі.")
             self._log("Канал передачі: ключі підтверджено, з'єднання готове.")
             self._update_send_button_state()
-            threading.Thread(target=self._receive_worker, args=(event["epoch"],), daemon=True).start()
+            threading.Thread(
+                target=self._receive_worker, args=(event["socket"], event["key"], event["epoch"]), daemon=True
+            ).start()
 
         elif kind == "receive_progress":
             self.progress_bar["value"] = event["pct"]
@@ -1079,9 +1423,11 @@ class SecureFileClientApp:
             self._set_status(f"Перевірка каналу: не вдалось надіслати ping — {event['error']}")
             self._log(f"Перевірка каналу: помилка — {event['error']}")
 
-    def _receive_worker(self, epoch: int):
+    def _receive_worker(self, sock, key: bytes, epoch: int):
         """Фоновий потік: приймає файли в profile.incoming_dir, доки інша сторона
-        не закриє з'єднання. Цикл — щоб приймати кілька послідовних передач за сеанс."""
+        не закриє з'єднання. Цикл — щоб приймати кілька послідовних передач за сеанс.
+        sock/key — знімок ЦЬОГО каналу (не self.channel_socket/channel_key — ті вже можуть
+        належати новому сеансу); виходить, щойно epoch змінився."""
         # Без агрегованого прогресу (на відміну від send) — receive_files не знає
         # загальної кількості/розміру файлів наперед, лише поточний.
         last_pct = {"value": -1}
@@ -1096,10 +1442,10 @@ class SecureFileClientApp:
             # Наразі єдиний тип — {"type":"pong"}, відповідь на наш send_ping (on_test_channel).
             self._put_channel_event(epoch, {"kind": "channel_test_ok"})
 
-        while True:
+        while epoch == self._session_epoch:
             try:
                 received = receive_files(
-                    self.channel_socket, self.channel_key, self.profile.incoming_dir,
+                    sock, key, self.profile.incoming_dir,
                     on_progress=on_progress, on_control=on_control,
                 )
                 self._put_channel_event(epoch, {"kind": "receive_done", "files": received})
@@ -1115,8 +1461,15 @@ class SecureFileClientApp:
                 self._put_channel_event(epoch, {"kind": "receive_error", "error": f"{type(e).__name__}: {e}"})
                 return
 
+    def _payload_matches_channel_key(self) -> bool:
+        """AES-архів має бути зашифрований САМЕ ключем підтвердженого каналу — інакше
+        отримувач не розпакує (після повтору/нового сеансу ключ міг змінитись)."""
+        if self._transfer_archive_key is None:
+            return True  # payload не залежить від ключа
+        return self.channel_key is not None and hmac.compare_digest(self._transfer_archive_key, self.channel_key)
+
     def _update_send_button_state(self):
-        ready = self.channel_verified and bool(self.transfer_payload)
+        ready = self.channel_verified and bool(self.transfer_payload) and self._payload_matches_channel_key()
         self.btn_send.configure(state="normal" if ready else "disabled")
 
     def on_test_channel(self):
@@ -1127,15 +1480,18 @@ class SecureFileClientApp:
             return
         self._set_status("Перевірка каналу: надсилаю ping...")
         self._log("Перевірка каналу: надсилаю ping.")
+        # Знімок сокета ЗАРАЗ — скидання сеансу між кліком і стартом потоку занулить self.channel_socket.
         threading.Thread(
-            target=self._test_channel_worker, args=(self._session_epoch,), daemon=True
+            target=self._test_channel_worker, args=(self.channel_socket, self._session_epoch), daemon=True
         ).start()
 
-    def _test_channel_worker(self, epoch: int):
+    def _test_channel_worker(self, sock, epoch: int):
         try:
-            send_ping(self.channel_socket)
-        except OSError as e:
-            self._put_channel_event(epoch, {"kind": "channel_test_failed", "error": str(e)})
+            if sock is None:
+                raise TransportError("канал закрито")
+            send_ping(sock)
+        except Exception as e:
+            self._put_channel_event(epoch, {"kind": "channel_test_failed", "error": f"{type(e).__name__}: {e}"})
 
     def _transfer_root_dir(self) -> str:
         if self.packed_archive_path:
@@ -1151,6 +1507,14 @@ class SecureFileClientApp:
         if not self.transfer_payload:
             messagebox.showwarning("Увага", "Спочатку натисніть «Ініціалізувати передачу».")
             return
+        if not self._payload_matches_channel_key():
+            messagebox.showwarning(
+                "Увага",
+                "Архів зашифровано іншим ключем, ніж ключ підтвердженого каналу — "
+                "натисніть «Ініціалізувати передачу» ще раз.",
+            )
+            self._update_send_button_state()
+            return
 
         self.btn_send.configure(state="disabled")
         self.progress_bar["value"] = 0
@@ -1160,11 +1524,15 @@ class SecureFileClientApp:
         self._log(f"Надсилання {len(self.transfer_payload)} файл(и/ів)...")
         threading.Thread(
             target=self._send_worker,
-            args=(self._transfer_root_dir(), list(self.transfer_payload), self._session_epoch),
+            args=(
+                self._transfer_root_dir(), list(self.transfer_payload), self._session_epoch,
+                self.channel_socket, self.channel_key,
+            ),
             daemon=True,
         ).start()
 
-    def _send_worker(self, root_dir: str, files: list, epoch: int):
+    def _send_worker(self, root_dir: str, files: list, epoch: int, sock=None, key: bytes | None = None):
+        """sock/key — знімок каналу на момент кліку (див. _receive_worker)."""
         # Агрегований прогрес по всіх файлах разом (розмір відомий заздалегідь — на
         # відміну від прийому, де файли йдуть потоком без наперед відомого підсумку).
         progress = {"prev_name": None, "bytes_before_current": 0, "prev_total": 0, "last_pct": -1}
@@ -1181,7 +1549,7 @@ class SecureFileClientApp:
 
         try:
             total_bytes = sum(os.path.getsize(f) for f in files) or 1
-            send_files(self.channel_socket, self.channel_key, root_dir, files, on_progress=on_progress)
+            send_files(sock, key, root_dir, files, on_progress=on_progress)
             self._put_channel_event(epoch, {"kind": "send_done", "count": len(files)})
         except TransportError as e:
             self._put_channel_event(epoch, {"kind": "send_error", "error": str(e)})
@@ -1296,6 +1664,8 @@ class SecureFileClientApp:
             self.var_transfer_status.set("")
             self.packed_archive_path = None
             self.transfer_payload = None
+            self._transfer_archive_key = None
+            self._update_send_button_state()
 
     def on_choose_dir(self):
         path = filedialog.askdirectory(
@@ -1311,6 +1681,8 @@ class SecureFileClientApp:
         self.selected_is_dir = True
         self.packed_archive_path = None
         self.transfer_payload = None
+        self._transfer_archive_key = None
+        self._update_send_button_state()
         self.lbl_selected.configure(text=f"Каталог: {path}")
 
         self._file_tree_checked = {}
@@ -1411,6 +1783,7 @@ class SecureFileClientApp:
         if not self.selected_is_dir:
             self.transfer_payload = [self.selected_path]
             self.packed_archive_path = None
+            self._transfer_archive_key = None
             self.var_transfer_status.set("Готово до передачі: 1 файл (як є).")
             self._set_status(f"Готово до передачі: {os.path.basename(self.selected_path)}.")
             self._log(f"Ініціалізація передачі: 1 файл як є — {self.selected_path}.")
@@ -1444,7 +1817,7 @@ class SecureFileClientApp:
                 if password is None:
                     messagebox.showwarning(
                         "Увага",
-                        "Спочатку виконайте хендшейк (згенеруйте свій або обробіть вхідний) — "
+                        "Спочатку виконайте хендшейк (згенеруйте свій або вставте отриманий) — "
                         "сесійний ключ використовується як пароль AES-шифрування архіву.",
                     )
                     return
@@ -1460,6 +1833,8 @@ class SecureFileClientApp:
 
             self.packed_archive_path = archive_path
             self.transfer_payload = [archive_path]
+            # Ключ, яким РЕАЛЬНО зашифровано архів — "Надіслати" звіряє його з channel_key.
+            self._transfer_archive_key = password
             self.lbl_selected.configure(
                 text=f"Каталог: {self.selected_path}  →  запаковано: {archive_path}"
             )
@@ -1477,6 +1852,7 @@ class SecureFileClientApp:
         else:
             self.packed_archive_path = None
             self.transfer_payload = included_files
+            self._transfer_archive_key = None
             self.var_transfer_status.set(
                 f"Готово до передачі: {len(included_files)} файл(и/ів) як є (без архівування)."
             )

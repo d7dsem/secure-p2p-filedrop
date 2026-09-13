@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Обгортка запуску тестів для Linux/macOS. Шлях рахується відносно цього
 # файлу, тому команда працює незалежно від поточної директорії.
+# Групи по шарах (docs/architecture.md) — усі аргументи передаються далі
+# в tests/_groups.py: назви груп/аліасів, прапорці unittest, дотовані імена.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,4 +15,4 @@ else
     PYTHON=python
 fi
 
-exec "$PYTHON" -m unittest discover -s "$TESTS_DIR" "$@"
+exec "$PYTHON" "$TESTS_DIR/_groups.py" "$@"

@@ -10,6 +10,7 @@ import hashlib
 import os
 import shutil
 import socket
+import sys
 import tempfile
 import threading
 import unittest
@@ -20,6 +21,7 @@ from transport import (
     ConnectionFailed,
     TransportError,
     VerificationError,
+    _is_self_connect,
     establish_connection,
     receive_files,
     send_files,
@@ -98,6 +100,26 @@ class EstablishConnectionTests(unittest.TestCase):
         with self.assertRaises(ConnectionFailed):
             establish_connection(port_a, None, None, timeout=1.0)
 
+    @unittest.skipUnless(sys.platform == "win32", "SO_EXCLUSIVEADDRUSE — лише Windows")
+    def test_second_bind_on_same_port_fails_clearly_on_windows(self):
+        """Регресія для знахідки (B): SO_REUSEADDR дозволяв другому сокету прив'язатись
+        до порту, що вже слухає (undefined behavior, хто прийме з'єднання) — тепер
+        SO_EXCLUSIVEADDRUSE має ловити конфлікт саме на bind() з чіткою помилкою."""
+        port_a, _port_b = _free_port_pair()
+        held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        held.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        held.bind(("0.0.0.0", port_a))
+        held.listen(1)
+        self.addCleanup(held.close)
+        try:
+            with self.assertRaises(ConnectionFailed) as ctx:
+                # peer_host=None => режим "лише слухати" => bind-помилка фатальна одразу.
+                establish_connection(port_a, None, None, timeout=2.0)
+            self.assertIn(str(port_a), str(ctx.exception))
+            self.assertIn("зайнятий", str(ctx.exception))
+        finally:
+            held.close()
+
 
 class VerifyChannelTests(unittest.TestCase):
     def _connected_pair(self):
@@ -168,6 +190,73 @@ class VerifyChannelTests(unittest.TestCase):
         self.assertEqual(outcomes.get("b"), "mismatch")
         sock_a.close()
         sock_b.close()
+
+    def test_peer_closed_during_verification_is_connection_failed_not_verification_error(self):
+        """Регресія для знахідки (A): обрив з'єднання під час підтвердження ключа не
+        повинен виглядати як "ключі не збігаються" (VerificationError) — це заважає
+        UI показати правильну підказку (appearance.py: connection_failed vs
+        verification_failed)."""
+        sock_a, sock_b = self._connected_pair()
+        sock_b.close()  # інша сторона обірвала з'єднання, не встигнувши підтвердити ключ
+        with self.assertRaises(ConnectionFailed):
+            verify_channel(sock_a, _KEY_A, timeout=2.0)
+        sock_a.close()
+
+    def test_timeout_during_verification_is_connection_failed_not_verification_error(self):
+        """Регресія для знахідки (A): таймаут очікування відповіді іншої сторони теж не
+        доказ розбіжності ключів."""
+        sock_a, sock_b = self._connected_pair()
+        try:
+            # sock_b навмисно нічого не шле — sock_a має впасти в таймаут очікування nonce.
+            with self.assertRaises(ConnectionFailed):
+                verify_channel(sock_a, _KEY_A, timeout=0.3)
+        finally:
+            sock_a.close()
+            sock_b.close()
+
+
+class SelfConnectDetectionTests(unittest.TestCase):
+    """Юніт-тест на рівні хелпера _is_self_connect (знахідка C) — реальний TCP
+    self-connect (getsockname()==getpeername() без явного bind()) залежить від ОС і
+    гонки видачі ефемерного порту, тож недетермінований для CI; тут перевіряємо саму
+    логіку порівняння напряму, без мережі."""
+
+    class _FakeSocket:
+        def __init__(self, local, peer):
+            self._local, self._peer = local, peer
+
+        def getsockname(self):
+            return self._local
+
+        def getpeername(self):
+            return self._peer
+
+    def test_matching_endpoints_detected_as_self_connect(self):
+        sock = self._FakeSocket(("127.0.0.1", 5000), ("127.0.0.1", 5000))
+        self.assertTrue(_is_self_connect(sock))
+
+    def test_different_endpoints_are_not_self_connect(self):
+        sock = self._FakeSocket(("127.0.0.1", 5000), ("127.0.0.1", 5001))
+        self.assertFalse(_is_self_connect(sock))
+
+    def test_real_loopback_pair_is_not_self_connect(self):
+        port_a, port_b = _free_port_pair()
+        results = {}
+
+        def side_a():
+            results["a"] = establish_connection(port_a, "127.0.0.1", port_b, timeout=10)
+
+        def side_b():
+            results["b"] = establish_connection(port_b, "127.0.0.1", port_a, timeout=10)
+
+        ta, tb = threading.Thread(target=side_a), threading.Thread(target=side_b)
+        ta.start(); tb.start()
+        ta.join(timeout=15); tb.join(timeout=15)
+
+        self.assertFalse(_is_self_connect(results["a"]))
+        self.assertFalse(_is_self_connect(results["b"]))
+        results["a"].close()
+        results["b"].close()
 
 
 class SendReceiveFilesTests(unittest.TestCase):

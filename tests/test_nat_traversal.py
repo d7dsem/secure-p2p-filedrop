@@ -5,8 +5,10 @@
 Що саме НЕ тестується і чому: docs/dev-notes.md → "tests/test_nat_traversal.py".
 """
 
+import socket
 import unittest
 import xml.etree.ElementTree as ET
+from unittest import mock
 
 import _pathfix  # noqa: F401  (додає src/ у sys.path перед наступними імпортами)
 
@@ -158,12 +160,17 @@ class SoapFaultExtractionTests(unittest.TestCase):
 
 class DiscoverIgdNoResponseTests(unittest.TestCase):
     def test_raises_upnp_unavailable_when_no_router_answers(self):
-        # Дуже короткий timeout у мережі без реального UPnP-роутера
-        # (наприклад, у CI/пісочниці) — SSDP не отримає жодної відповіді,
-        # і функція має впасти з керованою помилкою, а не зависнути/впасти
-        # з нечитабельним traceback.
-        with self.assertRaises(UpnpUnavailable):
-            discover_igd_control_url(timeout=0.2)
+        """Мокає сокет так, щоб жодна відповідь не "прилетіла" — реальний
+        M-SEARCH у LAN раніше падав на машинах, де роутер РЕАЛЬНО відповідає
+        (недетерміновано залежно від мережі). Тут перевіряємо лише керовану
+        поведінку: немає відповіді → UpnpUnavailable, без зависання."""
+        fake_sock = mock.MagicMock()
+        fake_sock.recvfrom.side_effect = socket.timeout()
+        with mock.patch("nat_traversal.socket.socket", return_value=fake_sock):
+            with self.assertRaises(UpnpUnavailable):
+                discover_igd_control_url(timeout=0.2)
+        fake_sock.sendto.assert_called_once()
+        fake_sock.close.assert_called_once()
 
 
 if __name__ == "__main__":

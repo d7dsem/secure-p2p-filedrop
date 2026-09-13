@@ -80,6 +80,16 @@ def recv_json(sock: socket.socket) -> dict:
 # досяжний (UPnP/STUN підготували адресу заздалегідь) — Docker/dev-notes.
 # --------------------------------------------------------------------------
 
+def _is_self_connect(sock: socket.socket) -> bool:
+    """True, якщо сокет з'єднаний сам із собою (getsockname() == getpeername()) —
+    рідкісний TCP self-connect edge-case: peer_host:peer_port збігся з власним
+    listener'ом цього ж процесу. Docs/dev-notes.md → "transport.py"."""
+    try:
+        return sock.getsockname() == sock.getpeername()
+    except OSError:
+        return False
+
+
 def establish_connection(
     local_port: int,
     peer_host: str | None,
@@ -95,7 +105,14 @@ def establish_connection(
     режимі "лише слухати", інша сторона підключається сама, дізнавшись наш
     host/port із хендшейку. Докладніше: docs/dev-notes.md → "transport.py".
 
-    Кидає ConnectionFailed, якщо нічого не вдалось за timeout."""
+    Кидає ConnectionFailed, якщо нічого не вдалось за timeout, порт зайнятий
+    (bind) або якщо peer_host/peer_port виявились адресою власного listener'а
+    цього ж процесу (self-connect).
+
+    Контракт stop_event: якщо викликач встановив stop_event ДО того, як цикл
+    установлення реально виграв гонку (наприклад скинув сесію в останню мить),
+    "виграний" сокет закривається і функція кидає ConnectionFailed замість
+    того, щоб мовчки повернути з'єднання, яке викликач уже вважає скасованим."""
     stop_event = stop_event or threading.Event()
     timeout = TRANSPORT.connect_timeout_seconds if timeout is None else timeout
     result: dict = {}
@@ -112,7 +129,16 @@ def establish_connection(
 
     def _accept_worker():
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # Windows: SO_REUSEADDR дозволяє ДРУГОМУ сокету прив'язатись до порту, який
+            # вже слухає — який з двох реально прийме з'єднання, невизначено (два
+            # інстанси застосунку на одному ПК на тому самому порту; "зомбі"-listener
+            # після скидання сесії). SO_EXCLUSIVEADDRUSE гарантує ексклюзивність —
+            # конфлікт ловиться саме на bind() з чіткою помилкою. Докладніше:
+            # docs/dev-notes.md → "transport.py".
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             listener.bind(("0.0.0.0", local_port))
             listener.listen(TRANSPORT.listen_backlog)
@@ -156,6 +182,15 @@ def establish_connection(
                 time.sleep(TRANSPORT.connect_retry_interval_seconds)
                 continue
             sock.settimeout(None)  # знімаємо короткий connect-таймаут — далі сокет блокуючий
+            if _is_self_connect(sock):
+                # peer_host:peer_port виявився адресою власного listener'а цього ж
+                # процесу — TCP-стек з'єднав сокет сам із собою. Рідкісний, але
+                # реальний edge-case; docs/dev-notes.md → "transport.py".
+                sock.close()
+                with result_lock:
+                    result.setdefault("self_connect", True)
+                done.set()
+                return
             if not _set_result(sock):
                 sock.close()
             return
@@ -166,12 +201,28 @@ def establish_connection(
     for t in threads:
         t.start()
     done.wait(timeout=timeout)
+    # Знімок ДО того, як ми самі позначимо зупинку нижче — щоб відрізнити "хтось
+    # ЗОВНІ (напр. скидання сесії) скасував ще до нашого виграшу" від нормального
+    # cleanup-сигналу для програвшого воркера (dev-notes.md → "transport.py").
+    externally_stopped = stop_event.is_set()
     stop_event.set()  # сигналізуємо іншому воркеру зупинитись, навіть якщо ми виграли
 
     with result_lock:
         sock = result.get("sock")
         bind_error = result.get("bind_error")
+        self_connect = result.get("self_connect", False)
+
+    if sock is not None and externally_stopped:
+        sock.close()
+        raise ConnectionFailed(
+            "З'єднання встановлено, але спробу вже скасовано (stop_event) — сокет закрито."
+        )
     if sock is None:
+        if self_connect:
+            raise ConnectionFailed(
+                f"Виявлено з'єднання із самим собою на порту {local_port} — "
+                f"перевірте адресу іншої сторони: це, ймовірно, власний listener цього процесу."
+            )
         if bind_error is not None and (peer_host is None or peer_port is None):
             raise ConnectionFailed(
                 f"Не вдалось слухати на порту {local_port}: {bind_error}. "
@@ -193,7 +244,16 @@ def establish_connection(
 # --------------------------------------------------------------------------
 
 def verify_channel(sock: socket.socket, key: bytes, timeout: float | None = None) -> None:
-    """Кидає VerificationError, якщо ключі не збігаються (або таймаут/обрив)."""
+    """Кидає VerificationError ЛИШЕ якщо код підтвердження ключа фактично отримано від
+    іншої сторони і він НЕ збігається (ключі справді різні, напр. одруківка в фразі) —
+    порівняння сталого часу (hmac.compare_digest), ключ ніколи не потрапляє в повідомлення.
+
+    Мережеві збої під час обміну — таймаут очікування відповіді, обрив з'єднання
+    (PeerClosed), помилка сокета (OSError) чи завеликий/побитий кадр (TransportError) —
+    НЕ є доказом розбіжності ключів і кидають ConnectionFailed (той самий тип, що й
+    establish_connection), а не VerificationError. Докладніше, включно з тим, що
+    appearance.py._channel_establish_worker наразі ще не розрізняє ці два винятки після
+    виклику verify_channel: docs/dev-notes.md → "transport.py"."""
     old_timeout = sock.gettimeout()
     sock.settimeout(TRANSPORT.verify_timeout_seconds if timeout is None else timeout)
     try:
@@ -208,10 +268,12 @@ def verify_channel(sock: socket.socket, key: bytes, timeout: float | None = None
         expected = hmac.new(key, my_nonce, hashlib.sha256).digest()
         if not hmac.compare_digest(peer_proof, expected):
             raise VerificationError("Код підтвердження ключа не збігається з іншою стороною.")
-    except (TransportError, OSError) as e:
-        if isinstance(e, VerificationError):
-            raise
-        raise VerificationError(f"Не вдалось підтвердити ключ: {e}") from e
+    except VerificationError:
+        raise
+    except (PeerClosed, TransportError, OSError) as e:
+        # OSError тут покриває й socket.timeout (це його підклас) — таймаут відповіді
+        # від іншої сторони теж НЕ є доказом розбіжності ключів.
+        raise ConnectionFailed(f"Не вдалось підтвердити ключ (мережева помилка): {e}") from e
     finally:
         sock.settimeout(old_timeout)
 

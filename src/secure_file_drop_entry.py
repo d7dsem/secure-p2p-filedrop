@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Точка входу застосунку. Мапа шарів і залежностей: docs/dev-notes.md → "secure_file_drop_entry.py".
+Точка входу застосунку. Мапа шарів і залежностей: docs/architecture.md.
 """
 
 import argparse
-import tkinter as tk
-from tkinter import ttk
-
-from appearance import SecureFileClientApp
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -33,6 +29,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main():
+    # tkinter/appearance імпортуються тут, не на рівні модуля, — щоб тести `cli`-групи
+    # (лише parse_args) не вантажили увесь GUI-стек.
+    import tkinter as tk
+    from tkinter import ttk
+
+    from appearance import SecureFileClientApp
+
     args = parse_args()
     root = tk.Tk()
     try:
