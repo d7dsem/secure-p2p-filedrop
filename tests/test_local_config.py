@@ -14,6 +14,7 @@ from pathlib import Path
 import _pathfix  # noqa: F401  (додає src/ у sys.path перед наступними імпортами)
 
 from local_config import LocalConfig, load_config, save_config
+from tuning import CONNECTION
 
 
 class LoadConfigTests(unittest.TestCase):
@@ -53,6 +54,37 @@ class LoadConfigTests(unittest.TestCase):
         self.assertTrue(config.incoming_dir)
         self.assertTrue(config.outgoing_dir)
 
+    def test_missing_file_default_port_is_tuning_default(self):
+        config = load_config(self.path)
+        self.assertEqual(config.default_port, CONNECTION.default_port)
+
+    def test_profile_without_port_field_falls_back_to_tuning_default(self):
+        """Профіль, збережений ДО появи default_port (зворотна сумісність)."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps({"client_id": "old-profile", "incoming_dir": "in", "outgoing_dir": "out"}),
+            encoding="utf-8",
+        )
+
+        config = load_config(self.path)
+        self.assertEqual(config.default_port, CONNECTION.default_port)
+
+    def test_valid_port_in_file_is_used(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({"default_port": 52074}), encoding="utf-8")
+
+        config = load_config(self.path)
+        self.assertEqual(config.default_port, 52074)
+
+    def test_invalid_port_values_fall_back_without_crashing(self):
+        for bad_port in ("not-a-number", 0, 70000, -1, None, True, [52074]):
+            with self.subTest(port=bad_port):
+                path = Path(self.tmp_dir) / f"config_{repr(bad_port)}.json"
+                path.write_text(json.dumps({"default_port": bad_port}), encoding="utf-8")
+
+                config = load_config(path)
+                self.assertEqual(config.default_port, CONNECTION.default_port)
+
 
 class SaveConfigTests(unittest.TestCase):
     def setUp(self):
@@ -66,11 +98,14 @@ class SaveConfigTests(unittest.TestCase):
         self.assertTrue(self.path.exists())
 
     def test_round_trip_save_then_load(self):
-        original = LocalConfig(client_id="round-trip-id", incoming_dir="/tmp/in", outgoing_dir="/tmp/out")
+        original = LocalConfig(
+            client_id="round-trip-id", incoming_dir="/tmp/in", outgoing_dir="/tmp/out", default_port=52074,
+        )
         save_config(original, self.path)
 
         loaded = load_config(self.path)
         self.assertEqual(loaded, original)
+        self.assertEqual(loaded.default_port, 52074)
 
     def test_save_overwrites_previous_content(self):
         save_config(LocalConfig(client_id="first", incoming_dir="a", outgoing_dir="b"), self.path)
@@ -82,7 +117,14 @@ class SaveConfigTests(unittest.TestCase):
     def test_written_file_is_readable_json_with_expected_keys(self):
         save_config(LocalConfig(client_id="c1", incoming_dir="in", outgoing_dir="out"), self.path)
         data = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(set(data.keys()), {"client_id", "incoming_dir", "outgoing_dir"})
+        self.assertEqual(set(data.keys()), {"client_id", "incoming_dir", "outgoing_dir", "default_port"})
+
+    def test_written_file_includes_explicit_default_port(self):
+        save_config(
+            LocalConfig(client_id="c1", incoming_dir="in", outgoing_dir="out", default_port=52074), self.path,
+        )
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(data["default_port"], 52074)
 
 
 if __name__ == "__main__":

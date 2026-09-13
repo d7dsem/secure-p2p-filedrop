@@ -31,6 +31,72 @@ from transport import (
 )
 from tuning import APPEARANCE, CONNECTION, ENCRYPTION, EXCHANGE, STUN
 
+
+class _Tooltip:
+    """Простий tooltip: Toplevel-віконце з текстом, яке з'являється при <Enter> на віджет.
+    На <Leave> або <ButtonPress> — знищується. Позиціюється біля курсора або віджета."""
+
+    def __init__(self, widget, text: str, delay_ms: int = 800, wraplength: int = 300):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self.wraplength = wraplength
+        self.tooltip = None
+        self.after_id = None
+
+        widget.bind("<Enter>", self._on_enter)
+        widget.bind("<Leave>", self._on_leave)
+        widget.bind("<ButtonPress>", self._on_leave)
+
+    def _on_enter(self, event):
+        """Запланувати показ tooltip після затримки."""
+        if self.after_id:
+            self.widget.after_cancel(self.after_id)
+        self.after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _on_leave(self, event=None):
+        """Скасувати запланований показ і знищити vidстійучий tooltip."""
+        if self.after_id:
+            self.widget.after_cancel(self.after_id)
+            self.after_id = None
+        self._destroy()
+
+    def _show(self):
+        """Створити й показати tooltip Toplevel."""
+        self._destroy()
+        self.tooltip = tk.Toplevel(self.widget)
+        self.tooltip.wm_overrideredirect(True)
+        self.tooltip.wm_attributes("-topmost", True)
+
+        label = tk.Label(
+            self.tooltip,
+            text=self.text,
+            wraplength=self.wraplength,
+            justify="left",
+            background=APPEARANCE.dark_bg,
+            foreground=APPEARANCE.dark_fg,
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=6,
+        )
+        label.pack()
+
+        # Позиціюємо біля верхнього лівого кута віджета
+        x = self.widget.winfo_rootx()
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+        self.tooltip.wm_geometry(f"+{x}+{y}")
+
+    def _destroy(self):
+        """Знищити tooltip Toplevel, якщо існує."""
+        if self.tooltip:
+            try:
+                self.tooltip.destroy()
+            except tk.TclError:
+                pass
+            self.tooltip = None
+
+
 _TREE_LOADING_SUFFIX = "/__loading__"
 _ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 
@@ -116,7 +182,7 @@ _HELP_TEXT = """Як користуватись
 
 1. Обидві сторони вводять ОДНАКОВУ парольну фразу (не передається мережею) — або одна сторона тисне "Згенерувати" біля пароля й передає готову фразу іншій тим самим каналом, що й хендшейк. Якщо натиснути "Згенерувати"/"Вставити хендшейк" із порожньою фразою — з'явиться віконце для її введення.
 2. Сторона A: у секції "Хендшейк" — "Згенерувати" (текст одразу копіюється в буфер обміну) → надсилає стороні B через месенджер (Signal/Telegram тощо).
-3. Сторона B: копіює отриманий текст → "Вставити хендшейк" (або Ctrl+V у полі) — хендшейк вставляється й одразу обробляється. Підпис над полем показує, що зараз у ньому: власний хендшейк чи хендшейк співрозмовника.
+3. Сторона B: копіює отриманий текст → "Вставити хендшейк" (або Ctrl+V у полі) — хендшейк вставляється й одразу обробляється. Код підтвердження показується під полем.
 4. Обидві сторони звіряють короткий код підтвердження (голосом/текстом через той самий месенджер) — мають збігатись. Якщо не збігаються — з'явиться віконце для виправлення фрази й повторної спроби (без ручного копіювання наново).
 5. Один сеанс — одна роль: якщо хендшейк уже згенеровано чи оброблено, повторне натискання "Згенерувати"/"Вставити хендшейк" запитає підтвердження — почати новий сеанс (поточний хендшейк і канал буде скинуто).
 6. З'єднання встановлюється й підтверджується автоматично (UPnP → STUN → LAN), без додаткових дій.
@@ -185,6 +251,14 @@ class SecureFileClientApp:
         # True лише на час програмної зміни var_passphrase під час повтору після розбіжності —
         # trace не має скидати хендшейк (_invalidate_session_if_active).
         self._suppress_param_invalidation: bool = False
+        # Порт: precedence профіль.default_port < CLI --port < ручна правка поля "Порт"
+        # (сеансова, у профіль не пишеться) — dev-notes.md → "--port CLI-параметр"/"local_config.py".
+        # _port_overridden_by_user — True лише після СПРАВЖНЬОЇ ручної правки поля користувачем;
+        # _suppress_port_override_tracking — True на час programmatic set() (initial/CLI/синхронізація
+        # з вкладки "Профіль"), щоб такі зміни не позначались як "ручні".
+        self._port_overridden_by_user: bool = False
+        self._suppress_port_override_tracking: bool = False
+        self._cli_port_provided: bool = initial_port is not None
         # >0 поки відкрите модальне віконце (askyesno/_prompt_passphrase) — verification_failed
         # відкладається, щоб діалоги не накладались (_handle_channel_event).
         self._modal_depth: int = 0
@@ -208,7 +282,15 @@ class SecureFileClientApp:
         self._log(f"Профіль завантажено: client_id={self.profile.client_id} ({config_path()}).")
 
         if initial_port is not None:
-            self.var_port.set(str(initial_port))
+            # CLI --port — не "ручна правка поля" для цілей precedence (dev-notes.md):
+            # не позначаємо _port_overridden_by_user, інакше зміна дефолту профілю
+            # пізніше вже ніколи не синхронізувала б поле, хоча CLI-порт сам по собі
+            # вже вище профілю в ієрархії (_cli_port_provided).
+            self._suppress_port_override_tracking = True
+            try:
+                self.var_port.set(str(initial_port))
+            finally:
+                self._suppress_port_override_tracking = False
 
         if initial_passphrase:
             self.var_passphrase.set(initial_passphrase)
@@ -489,7 +571,11 @@ class SecureFileClientApp:
         ttk.Label(frame_params, text="Порт:").grid(
             row=1, column=2, sticky="w", padx=(0, 4), pady=(0, 8)
         )
-        self.var_port = tk.StringVar(value=str(CONNECTION.default_port))
+        # Дефолт поля — профіль.default_port (CLI --port, якщо заданий, підставляється
+        # пізніше в __init__, ПІСЛЯ _build_ui). tuning.CONNECTION.default_port тут не
+        # використовується напряму — profile.default_port сам fallback-иться на нього
+        # при завантаженні профілю (local_config.py), якщо в файлі профілю його нема.
+        self.var_port = tk.StringVar(value=str(self.profile.default_port))
         ttk.Entry(frame_params, textvariable=self.var_port, width=8).grid(
             row=1, column=3, sticky="w", padx=(0, 8), pady=(0, 8)
         )
@@ -500,6 +586,10 @@ class SecureFileClientApp:
         self.var_passphrase.trace_add("write", self._invalidate_session_if_active)
         self.var_iterations.trace_add("write", self._invalidate_session_if_active)
         self.var_port.trace_add("write", self._invalidate_session_if_active)
+        # Окремий trace (не пов'язаний з інвалідацією сеансу) — відстежує лише факт
+        # СПРАВЖНЬОЇ ручної правки поля користувачем, для precedence з профілем
+        # (dev-notes.md → "local_config.py").
+        self.var_port.trace_add("write", self._mark_port_overridden)
 
         # БЕЗ кнопки: перевірка запускається автоматично (_start_connection_setup), лише звіт тут.
         frame_conn = ttk.LabelFrame(parent, text="Мережеві налаштування")
@@ -516,8 +606,8 @@ class SecureFileClientApp:
         # --- Секція: хендшейк — ОДНЕ поле, БЕЗ перемикача ролі: один сеанс = одна
         # роль (dev-notes.md → "Секція «Хендшейк»"). "Згенерувати" й "Вставити
         # хендшейк" — обидві дії, що можуть почати новий сеанс (з підтвердженням,
-        # якщо старий ще активний, _confirm_reset_if_needed). Підпис над полем
-        # (var_handshake_caption) відображає, що зараз у полі — не перемикач.
+        # якщо старий ще активний, _confirm_reset_if_needed). Кожна кнопка має
+        # tooltip з описом функції.
         frame_handshake = ttk.LabelFrame(parent, text="Хендшейк")
         frame_handshake.pack(fill="x", **pad)
 
@@ -525,21 +615,32 @@ class SecureFileClientApp:
         self._handshake_text: str = ""
         self._handshake_fingerprint: str = _FINGERPRINT_PLACEHOLDER
 
-        self.var_handshake_caption = tk.StringVar(value=_HANDSHAKE_CAPTION_EMPTY)
-        ttk.Label(
-            frame_handshake, textvariable=self.var_handshake_caption, wraplength=340, justify="left"
-        ).pack(fill="x", padx=8, pady=(8, 4), anchor="w")
-
         btns_handshake = ttk.Frame(frame_handshake)
-        btns_handshake.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Button(
+        btns_handshake.pack(fill="x", padx=8, pady=(8, 4))
+
+        btn_generate = ttk.Button(
             btns_handshake, text="Згенерувати", style="Accent.TButton",
             command=self.on_generate_handshake,
-        ).pack(side="left")
-        ttk.Button(
+        )
+        btn_generate.pack(side="left")
+        _Tooltip(
+            btn_generate,
+            "Згенерувати свій хендшейк — одразу копіюється в буфер. Надішліть його співрозмовнику через месенджер; застосунок чекатиме на з'єднання.",
+            delay_ms=APPEARANCE.tooltip_delay_ms,
+            wraplength=APPEARANCE.tooltip_wraplength,
+        )
+
+        btn_paste = ttk.Button(
             btns_handshake, text="Вставити хендшейк", style="Accent.TButton",
             command=self.on_paste_handshake,
-        ).pack(side="left", padx=8)
+        )
+        btn_paste.pack(side="left", padx=8)
+        _Tooltip(
+            btn_paste,
+            "Вставити хендшейк, отриманий від співрозмовника (з буфера обміну) — застосунок одразу підключиться.",
+            delay_ms=APPEARANCE.tooltip_delay_ms,
+            wraplength=APPEARANCE.tooltip_wraplength,
+        )
 
         self.text_handshake = scrolledtext.ScrolledText(
             frame_handshake, height=APPEARANCE.text_widget_height, wrap="char", font=self._mono_font
@@ -675,7 +776,8 @@ class SecureFileClientApp:
         self.progress_bar.pack(fill="x", pady=(2, 0))
 
     def _build_profile_tab(self, parent: ttk.Frame, pad: dict):
-        """local_config.py: client_id + дефолтні каталоги. На диск — лише по кнопці "Зберегти профіль"."""
+        """local_config.py: client_id + дефолтні каталоги + дефолтний порт. На диск —
+        лише по кнопці "Зберегти профіль". Дефолтний порт — dev-notes.md → "local_config.py"."""
         frame_id = ttk.LabelFrame(parent, text="Ідентифікатор клієнта")
         frame_id.pack(fill="x", **pad)
         self.var_client_id = tk.StringVar(value=self.profile.client_id)
@@ -708,6 +810,24 @@ class SecureFileClientApp:
         )
         ttk.Button(frame_dirs, text="Обрати...", command=self.on_choose_outgoing_dir).grid(
             row=3, column=1, padx=(0, 8), pady=(0, 8)
+        )
+
+        # Дефолтний порт профілю — низ ієрархії precedence (профіль < CLI --port < ручна
+        # правка поля "Порт" на вкладці "Сеанс"). dev-notes.md → "local_config.py".
+        frame_port = ttk.LabelFrame(parent, text="Порт за замовчуванням")
+        frame_port.pack(fill="x", **pad)
+        ttk.Label(frame_port, text="Порт:").grid(row=0, column=0, sticky="w", padx=8, pady=8)
+        self.var_profile_default_port = tk.StringVar(value=str(self.profile.default_port))
+        entry_profile_port = ttk.Entry(frame_port, textvariable=self.var_profile_default_port, width=8)
+        entry_profile_port.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=8)
+        _Tooltip(
+            entry_profile_port,
+            "Порт, яким одразу заповнюється поле «Порт» на вкладці «Сеанс» при наступному "
+            "запуску. При збереженні тут одразу оновлює й поточне поле «Порт» — але лише "
+            "якщо ви ще не редагували те поле вручну цього сеансу і не задали --port у CLI "
+            "(hierarchy: профіль < CLI < ручна правка).",
+            delay_ms=APPEARANCE.tooltip_delay_ms,
+            wraplength=APPEARANCE.tooltip_wraplength,
         )
 
         frame_save = ttk.Frame(parent)
@@ -794,6 +914,22 @@ class SecureFileClientApp:
             messagebox.showerror(
                 "Помилка",
                 f"Порт має бути цілим числом від {CONNECTION.min_port} до {CONNECTION.max_port}.",
+            )
+            return None
+
+    def _get_profile_default_port(self) -> int | None:
+        """Валідація поля "Порт за замовчуванням" на вкладці "Профіль" — той самий діапазон,
+        що й _get_port, окрема помилка (не плутати з полем "Порт" на вкладці "Сеанс")."""
+        try:
+            n = int(self.var_profile_default_port.get())
+            if not (CONNECTION.min_port <= n <= CONNECTION.max_port):
+                raise ValueError
+            return n
+        except ValueError:
+            messagebox.showerror(
+                "Помилка",
+                f"Порт за замовчуванням має бути цілим числом від {CONNECTION.min_port} "
+                f"до {CONNECTION.max_port}.",
             )
             return None
 
@@ -1013,16 +1149,10 @@ class SecureFileClientApp:
         )
 
     def _render_handshake_field(self):
-        """Показує в полі поточний текст/код і підпис над полем (порожньо/"Ваш
-        хендшейк"/"Хендшейк співрозмовника" — залежно від _handshake_kind)."""
+        """Показує в полі поточний текст/код й код підтвердження."""
         self.text_handshake.delete("1.0", "end")
         self.text_handshake.insert("1.0", self._handshake_text)
         self.lbl_handshake_fp.configure(text=self._handshake_fingerprint)
-        caption = {
-            _HANDSHAKE_KIND_MINE: _HANDSHAKE_CAPTION_MINE,
-            _HANDSHAKE_KIND_PEER: _HANDSHAKE_CAPTION_PEER,
-        }.get(self._handshake_kind, _HANDSHAKE_CAPTION_EMPTY)
-        self.var_handshake_caption.set(caption)
 
     def _show_handshake(self, kind: str, text: str, fingerprint: str):
         """Записує поточний вміст/код і його "роль" (лише внутрішній прапорець —
@@ -1209,6 +1339,16 @@ class SecureFileClientApp:
             "надішліть його іншій стороні повторно."
         )
         self._log("Параметри хендшейку змінено — попередній сеанс і канал скинуто.")
+
+    def _mark_port_overridden(self, *_trace_args):
+        """trace на var_port: позначає, що користувач ВРУЧНУ відредагував поле "Порт"
+        цього сеансу — після цього зміна дефолтного порту в профілі (вкладка "Профіль")
+        більше не підмінює поле автоматично (precedence: профіль < CLI < ручна правка,
+        dev-notes.md → "local_config.py"). Ігнорується під час programmatic set()
+        (initial/CLI/синхронізація з профілю) через _suppress_port_override_tracking."""
+        if self._suppress_port_override_tracking:
+            return
+        self._port_overridden_by_user = True
 
     def _maybe_start_channel_establishment(self):
         """Стартує встановлення каналу, щойно відомий сесійний ключ. peer_host/
@@ -1902,17 +2042,36 @@ class SecureFileClientApp:
             messagebox.showwarning("Увага", "Ідентифікатор клієнта не може бути порожнім.")
             return
 
+        new_default_port = self._get_profile_default_port()
+        if new_default_port is None:
+            return  # помилку вже показано (_get_profile_default_port)
+        port_changed = new_default_port != self.profile.default_port
+
         self.profile = LocalConfig(
             client_id=client_id,
             incoming_dir=self.var_incoming_dir.get().strip() or self.profile.incoming_dir,
             outgoing_dir=self.var_outgoing_dir.get().strip() or self.profile.outgoing_dir,
+            default_port=new_default_port,
         )
         save_config(self.profile)
+
+        # Синхронізація поля "Порт" (вкладка "Сеанс") — лише якщо користувач ще не
+        # редагував його вручну цього сеансу і порт не заданий явно через --port
+        # (hierarchy: профіль < CLI < ручна правка, dev-notes.md → "local_config.py").
+        # Просто і передбачувано: інші комбінації (CLI заданий, чи вже редагували
+        # вручну) НЕ підмінюються — вищий пріоритет у ієрархії не чіпаємо.
+        if port_changed and not self._port_overridden_by_user and not self._cli_port_provided:
+            self._suppress_port_override_tracking = True
+            try:
+                self.var_port.set(str(new_default_port))
+            finally:
+                self._suppress_port_override_tracking = False
 
         self.var_profile_status.set(f"Збережено ({config_path()}).")
         self._set_status("Профіль збережено.")
         self._log(
             f"Профіль збережено: client_id={self.profile.client_id}, "
-            f"incoming={self.profile.incoming_dir}, outgoing={self.profile.outgoing_dir}."
+            f"incoming={self.profile.incoming_dir}, outgoing={self.profile.outgoing_dir}, "
+            f"default_port={self.profile.default_port}."
         )
 

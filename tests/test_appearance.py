@@ -342,6 +342,105 @@ class InitialPortTests(AppearanceTestCase):
         self.assertEqual(self.app._session_epoch, 0)
 
 
+class PortPrecedenceTests(AppearanceTestCase):
+    """Ієрархія дефолтного порту (низ -> верх): tuning.CONNECTION.default_port
+    < profile.default_port < CLI --port < ручна правка поля "Порт" у GUI.
+    Докладніше: docs/dev-notes.md -> "var_port — дефолт з профілю"."""
+
+    def test_fresh_profile_uses_tuning_default(self):
+        from tuning import CONNECTION
+        self.assertEqual(self.app.var_port.get(), str(CONNECTION.default_port))
+        self.assertEqual(self.app.profile.default_port, CONNECTION.default_port)
+
+
+class ProfileDefaultPortUsedWhenNoCliTests(AppearanceTestCase):
+    """Профіль.default_port заповнює поле "Порт", коли --port не задано."""
+
+    def _create_app(self):
+        from appearance import SecureFileClientApp
+        from local_config import LocalConfig, save_config
+        save_config(LocalConfig(
+            client_id="pre-existing", incoming_dir="in", outgoing_dir="out", default_port=52099,
+        ))
+        return SecureFileClientApp(self.root)
+
+    def test_port_field_uses_profile_default(self):
+        self.assertEqual(self.app.var_port.get(), "52099")
+        self.assertFalse(self.app._port_overridden_by_user)
+        self.assertFalse(self.app._cli_port_provided)
+
+
+class CliPortOverridesProfileDefaultTests(AppearanceTestCase):
+    """CLI --port стоїть вище профілю в ієрархії — перекриває profile.default_port."""
+
+    def _create_app(self):
+        from appearance import SecureFileClientApp
+        from local_config import LocalConfig, save_config
+        save_config(LocalConfig(
+            client_id="pre-existing", incoming_dir="in", outgoing_dir="out", default_port=52099,
+        ))
+        return SecureFileClientApp(self.root, initial_port=52074)
+
+    def test_cli_port_wins_over_profile_default(self):
+        self.assertEqual(self.app.var_port.get(), "52074")
+        self.assertTrue(self.app._cli_port_provided)
+        # CLI не вважається "ручною правкою" для цілей precedence.
+        self.assertFalse(self.app._port_overridden_by_user)
+
+
+class ProfileTabDefaultPortSaveTests(AppearanceTestCase):
+    """on_save_profile: зміна "Порт за замовчуванням" синхронізує поле "Порт"
+    (вкладка "Сеанс") лише коли користувач ще не редагував його вручну й
+    --port не задано. Докладніше: dev-notes.md -> "var_port — дефолт з профілю"."""
+
+    def test_save_updates_main_port_field_when_untouched(self):
+        self.app.var_profile_default_port.set("52099")
+        self.app.on_save_profile()
+
+        self.assertEqual(self.app.var_port.get(), "52099")
+        self.assertEqual(self.app.profile.default_port, 52099)
+        # Синхронізація сама по собі не позначає поле як "відредаговане вручну".
+        self.assertFalse(self.app._port_overridden_by_user)
+
+    def test_save_does_not_touch_main_port_after_manual_edit(self):
+        self.app.var_port.set("60000")  # справжня ручна правка користувачем
+        self.assertTrue(self.app._port_overridden_by_user)
+
+        self.app.var_profile_default_port.set("52099")
+        self.app.on_save_profile()
+
+        self.assertEqual(self.app.var_port.get(), "60000")
+        self.assertEqual(self.app.profile.default_port, 52099)  # профіль однаково зберігається
+
+    def test_save_does_not_touch_main_port_when_cli_port_given(self):
+        from appearance import SecureFileClientApp
+        app = SecureFileClientApp(self.root, initial_port=52074)
+        app.var_profile_default_port.set("52099")
+
+        app.on_save_profile()
+
+        self.assertEqual(app.var_port.get(), "52074")
+        self.assertEqual(app.profile.default_port, 52099)
+
+    def test_invalid_profile_port_shows_error_and_does_not_save(self):
+        old_default_port = self.app.profile.default_port
+        self.app.var_profile_default_port.set("not-a-port")
+
+        with mock.patch("appearance.messagebox.showerror") as mock_error:
+            self.app.on_save_profile()
+
+        mock_error.assert_called_once()
+        self.assertEqual(self.app.profile.default_port, old_default_port)
+
+    def test_out_of_range_profile_port_shows_error_and_does_not_save(self):
+        self.app.var_profile_default_port.set("70000")
+
+        with mock.patch("appearance.messagebox.showerror") as mock_error:
+            self.app.on_save_profile()
+
+        mock_error.assert_called_once()
+
+
 class PasteHandshakeTests(AppearanceTestCase):
     """on_paste_handshake — обхід Ctrl+V/контекстного меню. Вставлене одразу
     обробляється; у полі з'являється лише після успішного розбору. Докладніше: dev-notes.md."""
@@ -483,10 +582,6 @@ class HandshakeSectionTests(AppearanceTestCase):
         with mock.patch("appearance.messagebox.askyesno", return_value=True):
             self._paste(text)
 
-    def test_caption_is_empty_hint_by_default(self):
-        from appearance import _HANDSHAKE_CAPTION_EMPTY
-        self.assertEqual(self.app.var_handshake_caption.get(), _HANDSHAKE_CAPTION_EMPTY)
-
     def test_generate_copies_handshake_to_clipboard(self):
         self.app.root.clipboard_clear()
         self.app.on_generate_handshake()
@@ -494,16 +589,15 @@ class HandshakeSectionTests(AppearanceTestCase):
         self.assertTrue(content)
         self.assertEqual(self.app.root.clipboard_get(), content)
 
-    def test_generate_sets_mine_caption_and_kind(self):
-        from appearance import _HANDSHAKE_CAPTION_MINE, _HANDSHAKE_KIND_MINE
+    def test_generate_sets_mine_kind_and_fingerprint(self):
+        from appearance import _HANDSHAKE_KIND_MINE
         self.app.on_generate_handshake()
         self.assertEqual(self.app._handshake_kind, _HANDSHAKE_KIND_MINE)
-        self.assertEqual(self.app.var_handshake_caption.get(), _HANDSHAKE_CAPTION_MINE)
         self.assertIn("Код підтвердження: ", self.app.lbl_handshake_fp.cget("text"))
         self.assertNotIn("—", self.app.lbl_handshake_fp.cget("text"))
 
-    def test_paste_sets_peer_caption_kind_and_processes(self):
-        from appearance import _HANDSHAKE_CAPTION_PEER, _HANDSHAKE_KIND_PEER
+    def test_paste_sets_peer_kind_and_processes(self):
+        from appearance import _HANDSHAKE_KIND_PEER
         from connection import derive_key
         peer_text, peer_salt = self._peer_handshake()
 
@@ -511,7 +605,6 @@ class HandshakeSectionTests(AppearanceTestCase):
 
         self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), peer_text)
         self.assertEqual(self.app._handshake_kind, _HANDSHAKE_KIND_PEER)
-        self.assertEqual(self.app.var_handshake_caption.get(), _HANDSHAKE_CAPTION_PEER)
         self.assertEqual(self.app.peer_key, derive_key("shared-pass", peer_salt, self.min_iterations))
         self.assertEqual((self.app.peer_host, self.app.peer_port), ("192.168.1.50", 52075))
 
@@ -529,15 +622,13 @@ class HandshakeSectionTests(AppearanceTestCase):
         self.assertNotIn("should-not-appear", self.app.text_log.get("1.0", "end"))
         self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), "")
 
-    def test_invalidation_clears_handshake_text_and_caption(self):
-        from appearance import _HANDSHAKE_CAPTION_EMPTY
+    def test_invalidation_clears_handshake_text_and_fingerprint(self):
         self.app.on_generate_handshake()
 
         self.app.var_port.set("52099")
 
         self.assertEqual(self.app.text_handshake.get("1.0", "end").strip(), "")
         self.assertIsNone(self.app._handshake_kind)
-        self.assertEqual(self.app.var_handshake_caption.get(), _HANDSHAKE_CAPTION_EMPTY)
         self.assertEqual(self.app.lbl_handshake_fp.cget("text"), "Код підтвердження: —")
 
     def test_only_one_key_set_after_switching_roles_and_session_key_matches_fingerprint(self):
@@ -1409,6 +1500,98 @@ class OpenIncomingDirTests(AppearanceTestCase):
 
         mock_popen.assert_called_once_with(["xdg-open", real_dir])
         mock_startfile.assert_not_called()
+
+
+class HandshakeButtonTooltipTests(AppearanceTestCase):
+    """Кнопки хендшейку мають tooltip з описом функції. Tooltip — _Tooltip class,
+    яка з'являється при <Enter> після затримки і знищується при <Leave>."""
+
+    def test_tooltip_creates_toplevel_on_show(self):
+        """_Tooltip._show() створює Toplevel віконце з текстом tooltip."""
+        import tkinter as tk
+        from appearance import _Tooltip
+
+        test_widget = tk.Button(self.app.root, text="Test")
+        test_widget.pack()
+        tooltip_text = "Test tooltip content"
+        tooltip = _Tooltip(test_widget, tooltip_text, delay_ms=0)
+
+        # Прямо викликаємо _show() замість event_generate
+        tooltip._show()
+
+        # Tooltip повинен створити Toplevel віконце
+        self.assertIsNotNone(tooltip.tooltip)
+        self.assertIsInstance(tooltip.tooltip, tk.Toplevel)
+
+        # Перевіряємо, що текст присутній у Toplevel
+        found_text = False
+        for child in tooltip.tooltip.winfo_children():
+            if hasattr(child, 'cget'):
+                if child.cget('text') == tooltip_text:
+                    found_text = True
+                    break
+        self.assertTrue(found_text, "Текст tooltip не знайдено у Toplevel")
+
+        tooltip._destroy()
+
+    def test_tooltip_destroyed_on_leave(self):
+        """При <Leave> tooltip знищується."""
+        import tkinter as tk
+        from appearance import _Tooltip
+
+        test_widget = tk.Button(self.app.root, text="Test")
+        test_widget.pack()
+        tooltip = _Tooltip(test_widget, "Test tooltip", delay_ms=0)
+
+        # Показуємо tooltip
+        tooltip._show()
+        self.assertIsNotNone(tooltip.tooltip)
+
+        # Повинен знищуватись при <Leave>
+        tooltip._on_leave()
+        self.assertIsNone(tooltip.tooltip)
+
+    def test_tooltip_destroyed_on_button_press(self):
+        """При <ButtonPress> tooltip знищується."""
+        import tkinter as tk
+        from appearance import _Tooltip
+
+        test_widget = tk.Button(self.app.root, text="Test")
+        test_widget.pack()
+        tooltip = _Tooltip(test_widget, "Test tooltip", delay_ms=0)
+
+        # Показуємо tooltip
+        tooltip._show()
+        self.assertIsNotNone(tooltip.tooltip)
+
+        # Повинен знищуватись при натисканні
+        tooltip._on_leave()
+        self.assertIsNone(tooltip.tooltip)
+
+    def test_tooltip_has_correct_styling(self):
+        """Tooltip використовує кольори з APPEARANCE."""
+        import tkinter as tk
+        from appearance import _Tooltip
+        from tuning import APPEARANCE
+
+        test_widget = tk.Button(self.app.root, text="Test")
+        test_widget.pack()
+        tooltip = _Tooltip(test_widget, "Test tooltip", delay_ms=0)
+
+        tooltip._show()
+
+        # Перевіряємо, що Label у Toplevel має правильні кольори
+        found_label = False
+        for child in tooltip.tooltip.winfo_children():
+            if hasattr(child, 'cget'):
+                bg = child.cget('background')
+                fg = child.cget('foreground')
+                if bg == APPEARANCE.dark_bg and fg == APPEARANCE.dark_fg:
+                    found_label = True
+                    break
+        self.assertTrue(found_label, "Label з правильними кольорами не знайдено")
+
+        tooltip._destroy()
 
 
 if __name__ == "__main__":

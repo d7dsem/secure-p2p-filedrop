@@ -71,6 +71,8 @@ class AppearanceTuning:
     text_widget_height: int = 6
     base_font_size_delta: int = 1  # наскільки збільшити системний дефолт (дрібний за замовчуванням)
     heading_font_size_delta: int = 1  # наскільки заголовки секцій більші за (вже збільшений) базовий шрифт
+    tooltip_delay_ms: int = 800  # час до появи tooltip при наведенні
+    tooltip_wraplength: int = 300  # максимальна ширина тексту tooltip перед переносом на новий рядок
 
     # Палітра темної теми (ttk не має її "з коробки"). Докладніше: docs/dev-notes.md.
     dark_bg: str = "#1e1e1e"

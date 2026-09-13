@@ -23,7 +23,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--port", dest="port", type=int, default=None,
         help="Порт, яким одразу заповнити поле в GUI (зручно для двох інстансів на "
-             "одному ПК — кожному свій порт без ручного редагування поля).",
+             "одному ПК — кожному свій порт без ручного редагування поля). Не вказано — "
+             "поле заповнюється дефолтним портом з профілю (local_config.py).",
     )
     return parser.parse_args(argv)
 
